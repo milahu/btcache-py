@@ -18,7 +18,7 @@ logger = None
 
 def get_logger():
     # Create a custom logger
-    logger = logging.getLogger("test-leecher")
+    logger = logging.getLogger("btcache-test-leecher")
     logger.setLevel(logging.DEBUG)
     # Create console handler
     ch = logging.StreamHandler()
@@ -85,7 +85,7 @@ def main():
     info_hash_bytes = bytes.fromhex(btih_hex)
     atp = lt.add_torrent_params()
     atp.info_hash = lt.sha1_hash(info_hash_bytes)
-    atp.save_path = "./test-leecher-downloads"
+    atp.save_path = "./btcache-test-leecher-downloads"
     atp.flags &= ~lt.torrent_flags.auto_managed
     atp.flags &= ~lt.torrent_flags.paused  # start immediately
     atp.trackers = []  # no trackers

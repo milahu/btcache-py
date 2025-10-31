@@ -51,7 +51,7 @@ def parse_args():
     )
     parser.add_argument(
         "--save", # args.save
-        default="test-seeder-downloads",
+        default="btcache-seeder-downloads",
         help="Folder where the torrent data is stored",
     )
     parser.add_argument(
