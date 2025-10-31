@@ -6,6 +6,7 @@ import logging
 import argparse
 import ipaddress
 import socket
+import itertools
 
 import libtorrent as lt
 
@@ -112,7 +113,8 @@ def main():
                 ip = getattr(p, "ip", None)
                 pieces_bitfield = getattr(p, "pieces", [])
                 missing_pieces = [i for i, has in enumerate(pieces_bitfield) if not has]
-                logger.info(f"  peer {ip} missing pieces: {missing_pieces}")
+                missing_piece_ranges = compress_ranges(missing_pieces)
+                logger.info(f"  peer {ip} missing pieces: {missing_piece_ranges}")
             time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
         logger.info("Seeder shutting down.")
@@ -133,6 +135,22 @@ def get_ip_filter_of_allowed_peers(allowed_peers):
         ip_filter.add_rule(ip, ip, 0)
 
     return ip_filter
+
+
+def compress_ranges(indices):
+    """Compress sorted indices like [0,1,2,5,6] -> '[0-2, 5-6]'"""
+    if not indices:
+        return []
+    ranges = []
+    for k, g in itertools.groupby(enumerate(indices), lambda x: x[1] - x[0]):
+        group = list(g)
+        start = group[0][1]
+        end = group[-1][1]
+        if start == end:
+            ranges.append(f"{start}")
+        else:
+            ranges.append(f"{start}-{end}")
+    return "[" + ", ".join(ranges) + "]"
 
 
 if __name__ == "__main__":

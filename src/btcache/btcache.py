@@ -16,6 +16,7 @@ import threading
 import urllib.parse
 from typing import List, Tuple, Optional
 from dataclasses import dataclass, field, asdict
+import itertools
 
 import requests
 import libtorrent as lt
@@ -227,11 +228,12 @@ class BTCache:
         pieces_bitfield = getattr(p, "pieces", [])
         is_seed = all(pieces_bitfield)
         missing_pieces = [i for i, has in enumerate(pieces_bitfield) if not has]
+        missing_piece_ranges = compress_ranges(missing_pieces)
         if is_seed:
-            self.logger.info(f"seeder peer {ip}:{port} seed={is_seed} missing={missing_pieces}")
+            self.logger.info(f"seeder peer {ip}:{port} seed={is_seed} missing={missing_piece_ranges}")
             return
 
-        self.logger.info(f"leecher peer {ip}:{port} seed={is_seed} missing={missing_pieces}")
+        self.logger.info(f"leecher peer {ip}:{port} seed={is_seed} missing={missing_piece_ranges}")
         current_priorities = [th.piece_priority(i) for i in range(th.torrent_file().num_pieces())]
         to_fetch = []
         for i in missing_pieces:
@@ -241,30 +243,44 @@ class BTCache:
             if len(to_fetch) >= self.config.max_incremental_fetch:
                 break
         if to_fetch:
-            self.logger.info(f"Fetching pieces from hidden peers: {to_fetch}")
+            self.logger.info(f"Fetching pieces from hidden peers: {compress_ranges(to_fetch)}")
             th.prioritize_pieces(current_priorities)
             self.ensure_hidden_peers_connected(th)
 
     def monitor_torrent(self, th, host):
         try:
-            # request lt.peer_info_alert
             th.post_peer_info()
         except Exception:
             pass
+
         try:
             status = th.status()
-            n_pieces = th.torrent_file().num_pieces()
-            enabled_pieces = "".join(
-                ["1" if th.piece_priority(i) > 0 else "0" for i in range(n_pieces)]
-            )
-            downloaded_pieces = "".join("Y" if th.have_piece(i) else "N" for i in range(n_pieces))
-            btih = th.torrent_file().info_hashes().v1
+            tf = th.torrent_file()
+            n_pieces = tf.num_pieces()
+            btih = tf.info_hashes().v1
+
+            # Collect enabled and downloaded piece indices
+            enabled_indices = [i for i in range(n_pieces) if th.piece_priority(i) > 0]
+            have_indices = [i for i in range(n_pieces) if th.have_piece(i)]
+
+            # Compress ranges for readability
+            enabled_ranges = compress_ranges(enabled_indices)
+            have_ranges = compress_ranges(have_indices)
+
+            # Compute byte-level progress
+            total = status.total_wanted
+            done = status.total_wanted_done
+            percent = (done / total * 100) if total > 0 else 0.0
+
             self.logger.info(
-                f"host={host}: btih={btih} state={status.state} done={status.total_done} "
-                f"enabled={enabled_pieces} have={downloaded_pieces}"
+                f"host={host}: btih={btih} state={status.state} "
+                f"progress={done}/{total} bytes ({percent:.2f}%) "
+                f"enabled={enabled_ranges} have={have_ranges}"
             )
+
             if str(status.state) == "downloading":
                 self.ensure_hidden_peers_connected(th)
+
         except Exception as e:
             self.logger.info(f"Error fetching status for torrent: {e}")
 
@@ -295,6 +311,22 @@ class BTCache:
                 time.sleep(60)
         except KeyboardInterrupt:
             self.logger.info("Shutting down")
+
+
+def compress_ranges(indices):
+    """Compress sorted indices like [0,1,2,5,6] -> '[0-2, 5-6]'"""
+    if not indices:
+        return []
+    ranges = []
+    for k, g in itertools.groupby(enumerate(indices), lambda x: x[1] - x[0]):
+        group = list(g)
+        start = group[0][1]
+        end = group[-1][1]
+        if start == end:
+            ranges.append(f"{start}")
+        else:
+            ranges.append(f"{start}-{end}")
+    return "[" + ", ".join(ranges) + "]"
 
 
 # ----------------------------------------------------------------------

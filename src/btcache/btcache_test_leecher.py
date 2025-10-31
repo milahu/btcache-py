@@ -5,6 +5,7 @@ import time
 import socket
 import logging
 import argparse
+import itertools
 
 import libtorrent as lt
 
@@ -56,6 +57,23 @@ def parse_args():
     )
     return parser.parse_args()
 
+
+def compress_ranges(indices):
+    """Compress sorted indices like [0,1,2,5,6] -> '[0-2, 5-6]'"""
+    if not indices:
+        return []
+    ranges = []
+    for k, g in itertools.groupby(enumerate(indices), lambda x: x[1] - x[0]):
+        group = list(g)
+        start = group[0][1]
+        end = group[-1][1]
+        if start == end:
+            ranges.append(f"{start}")
+        else:
+            ranges.append(f"{start}-{end}")
+    return "[" + ", ".join(ranges) + "]"
+
+
 def main():
     global logger
     logger = get_logger()
@@ -103,7 +121,18 @@ def main():
             peers = th.get_peer_info()
             status = th.status()
             downloading = [i for i, v in enumerate(status.pieces) if not v and th.piece_priority(i) > 0]
-            logger.info(f"state={status.state} fetching_pieces={downloading}")
+            compressed = compress_ranges(downloading)
+
+            # Compute progress
+            total = status.total_wanted
+            done = status.total_wanted_done
+            percent = (done / total * 100) if total > 0 else 0.0
+
+            logger.info(
+                f"state={status.state} progress={done}/{total} bytes ({percent:.2f}%) "
+                f"fetching_pieces={compressed}"
+            )
+
             for p in peers:
                 ip, port = getattr(p, "ip", None)
                 interested = getattr(p, "remote_interested", False)
@@ -111,9 +140,10 @@ def main():
                 logger.info(f"  peer={ip}:{port} interested={interested} choked={choked}")
 
         except Exception as e:
-            logger.info("Error querying peers:", e)
+            logger.info(f"Error querying peers: {e}")
 
         time.sleep(POLL_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
