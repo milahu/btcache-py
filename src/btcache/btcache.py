@@ -199,50 +199,74 @@ class BTCache:
         cfg = self.config
         while True:
             alerts = self.session.pop_alerts()
-            for a in alerts:
-                if isinstance(a, lt.peer_info_alert):
-                    th = next(iter(self.torrent_handles.values()))[0] if self.torrent_handles else None
-                    if not th:
-                        continue
-                    peers = th.get_peer_info()
-                    for p in peers:
-                        ip, port = getattr(p, "ip", None)
-                        pieces_bitfield = getattr(p, "pieces", [])
-                        is_seed = all(pieces_bitfield)
-                        missing_pieces = [i for i, has in enumerate(pieces_bitfield) if not has]
-                        self.logger.info(f"peer {ip}:{port} seed={is_seed} missing={missing_pieces}")
-
-                        current_priorities = [th.piece_priority(i) for i in range(th.torrent_file().num_pieces())]
-                        to_fetch = []
-                        for i in missing_pieces:
-                            if not th.have_piece(i) and current_priorities[i] == 0:
-                                current_priorities[i] = 1
-                                to_fetch.append(i)
-                            if len(to_fetch) >= cfg.max_incremental_fetch:
-                                break
-                        if to_fetch:
-                            self.logger.info(f"Fetching pieces from hidden peers: {to_fetch}")
-                            th.prioritize_pieces(current_priorities)
-                            self.ensure_hidden_peers_connected(th)
+            self.monitor_alerts(alerts)
 
             for host, th_list in self.torrent_handles.items():
                 for th in th_list:
-                    try:
-                        th.post_peer_info()
-                        status = th.status()
-                        n_pieces = th.torrent_file().num_pieces()
-                        enabled_pieces = "".join("1" if th.piece_priority(i) > 0 else "0" for i in range(n_pieces))
-                        downloaded_pieces = "".join("Y" if th.have_piece(i) else "N" for i in range(n_pieces))
-                        self.logger.info(
-                            f"{host}: state={status.state} done={status.total_done} "
-                            f"enabled={enabled_pieces} have={downloaded_pieces}"
-                        )
-                        if str(status.state) == "downloading":
-                            self.ensure_hidden_peers_connected(th)
-                    except Exception as e:
-                        self.logger.info(f"Error fetching status for torrent: {e}")
+                    self.monitor_torrent(th, host)
 
             time.sleep(cfg.poll_interval)
+
+    def monitor_alerts(self, alerts):
+        for a in alerts:
+            if isinstance(a, lt.peer_info_alert):
+                self.monitor_peer_info_alert(a)
+
+    def monitor_peer_info_alert(self, a):
+        if not self.torrent_handles:
+            return
+
+        for host, th_list in self.torrent_handles.items():
+            for th in th_list:
+                peers = th.get_peer_info()
+                for p in peers:
+                    self.monitor_peer(p, th, host)
+
+    def monitor_peer(self, p, th, host):
+        ip, port = getattr(p, "ip", None)
+        pieces_bitfield = getattr(p, "pieces", [])
+        is_seed = all(pieces_bitfield)
+        missing_pieces = [i for i, has in enumerate(pieces_bitfield) if not has]
+        if is_seed:
+            self.logger.info(f"seeder peer {ip}:{port} seed={is_seed} missing={missing_pieces}")
+            return
+
+        self.logger.info(f"leecher peer {ip}:{port} seed={is_seed} missing={missing_pieces}")
+        current_priorities = [th.piece_priority(i) for i in range(th.torrent_file().num_pieces())]
+        to_fetch = []
+        for i in missing_pieces:
+            if not th.have_piece(i) and current_priorities[i] == 0:
+                current_priorities[i] = 1
+                to_fetch.append(i)
+            if len(to_fetch) >= self.config.max_incremental_fetch:
+                break
+        if to_fetch:
+            self.logger.info(f"Fetching pieces from hidden peers: {to_fetch}")
+            th.prioritize_pieces(current_priorities)
+            self.ensure_hidden_peers_connected(th)
+
+    def monitor_torrent(self, th, host):
+        try:
+            # request lt.peer_info_alert
+            th.post_peer_info()
+        except Exception:
+            pass
+        try:
+            status = th.status()
+            n_pieces = th.torrent_file().num_pieces()
+            enabled_pieces = "".join(
+                ["1" if th.piece_priority(i) > 0 else "0" for i in range(n_pieces)]
+            )
+            downloaded_pieces = "".join("Y" if th.have_piece(i) else "N" for i in range(n_pieces))
+            btih = th.torrent_file().info_hashes().v1
+            self.logger.info(
+                f"host={host}: btih={btih} state={status.state} done={status.total_done} "
+                f"enabled={enabled_pieces} have={downloaded_pieces}"
+            )
+            if str(status.state) == "downloading":
+                self.ensure_hidden_peers_connected(th)
+        except Exception as e:
+            self.logger.info(f"Error fetching status for torrent: {e}")
 
     # ------------------------------------------------------------------
     # Main control
