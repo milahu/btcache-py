@@ -10,14 +10,16 @@ setup(
     author_email="milahu@gmail.com",
     url="https://github.com/milahu/btcache-py",
     python_requires=">=3.0",
-    py_modules=["btcache"],
+    # py_modules=["btcache"],
     install_requires=[
         "requests>=2.0.0",
         "libtorrent>=2.0.0",
     ],
     entry_points={
         "console_scripts": [
-            "btcache=btcache:main",
+            "btcache=btcache.btcache:main",
+            "btcache-seeder=btcache.btcache_seeder:main",
+            "btcache-test-leecher=btcache.btcache_test_leecher:main",
         ],
     },
     classifiers=[
