@@ -4,6 +4,8 @@ import os
 import time
 import logging
 import argparse
+import ipaddress
+import socket
 
 import libtorrent as lt
 
@@ -17,7 +19,7 @@ logger = None
 
 def get_logger():
     # Create a custom logger
-    logger = logging.getLogger("test-seeder")
+    logger = logging.getLogger("btcache-seeder")
     logger.setLevel(logging.DEBUG)
     # Create console handler
     ch = logging.StreamHandler()
@@ -38,21 +40,28 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Hidden BitTorrent Seeder")
     # TODO if args.torrent is unset, generate a random test torrent
     parser.add_argument(
-        "--torrent",
+        "--torrent", # args.torrent
         required=True,
         help="Path to the .torrent file",
     )
     parser.add_argument(
-        "--listen",
+        "--listen", # args.listen
         required=True,
         help="Listen address:port. example: 127.0.0.1:6881",
     )
     parser.add_argument(
-        "--save",
+        "--save", # args.save
         default="test-seeder-downloads",
         help="Folder where the torrent data is stored",
     )
+    parser.add_argument(
+        "--allowed-peers", # args.allowed_peers
+        metavar="ADDR",
+        nargs="+",
+        help="List of allowed peers by IP address",
+    )
     return parser.parse_args()
+
 
 def main():
     global logger
@@ -73,6 +82,9 @@ def main():
 
     # Create session
     ses = lt.session(settings)
+
+    if args.allowed_peers:
+        ses.set_ip_filter(get_ip_filter_of_allowed_peers(args.allowed_peers))
 
     # Load torrent info
     ti = lt.torrent_info(args.torrent)
@@ -104,6 +116,24 @@ def main():
             time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
         logger.info("Seeder shutting down.")
+
+
+def get_ip_filter_of_allowed_peers(allowed_peers):
+
+    # Create a new ip_filter
+    ip_filter = lt.ip_filter()
+
+    # 1. Block everything
+    ip_filter.add_rule("0.0.0.0", "255.255.255.255", 1)
+    ip_filter.add_rule("::", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", 1)
+
+    # 2. Allow specific IPs
+    for ip in allowed_peers:
+        addr = ipaddress.ip_address(ip)
+        ip_filter.add_rule(ip, ip, 0)
+
+    return ip_filter
+
 
 if __name__ == "__main__":
     main()
