@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import io
 import time
 import logging
 import argparse
@@ -9,6 +10,7 @@ import socket
 import itertools
 
 import libtorrent as lt
+import torf
 
 # seconds between alert checks / actions
 POLL_INTERVAL = 1.0
@@ -78,6 +80,10 @@ def main():
     settings['enable_natpmp'] = False
     settings['enable_lsd'] = False
     settings['enable_dht'] = False
+    # TODO implement the setting enable_trackers in libtorrent
+    # https://github.com/arvidn/libtorrent/issues/8050
+    if 'enable_trackers' in settings:
+        settings['enable_trackers'] = False
     settings['active_tracker_limit'] = 0 # disable trackers?
     # settings['allow_multiple_connections_per_ip'] = True # only needed in btcache
 
@@ -88,7 +94,20 @@ def main():
         ses.set_ip_filter(get_ip_filter_of_allowed_peers(args.allowed_peers))
 
     # Load torrent info
-    ti = lt.torrent_info(args.torrent)
+    ti = None
+    if 'enable_trackers' in settings:
+        ti = lt.torrent_info(args.torrent)
+        # ti.trackers = lambda: [] # not working
+        # there is ti.add_tracker but no ti.remove_tracker or ti.remove_trackers
+    else:
+        # workaround: use torf to remove trackers
+        # NOTE torf does not support v2 torrents
+        torrent = torf.Torrent.read(args.torrent)
+        torrent.trackers = [] # remove trackers
+        buf = io.BytesIO()
+        torrent.write_stream(buf)
+        ti = lt.torrent_info(buf.getvalue())
+        del buf
 
     # Add torrent with auto_managed=False, paused=False
     atp = lt.add_torrent_params()

@@ -8,6 +8,7 @@ pkgs.mkShell {
       libtorrent-rasterbar
       requests
       pyyaml
+      torf
     ]))
   ];
 }
