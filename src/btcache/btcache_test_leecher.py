@@ -55,6 +55,11 @@ def parse_args():
         required=True,
         help="Torrent infohash (hex)",
     )
+    parser.add_argument(
+        "--enable-seeding", # args.enable_seeding
+        action="store_true",
+        help="Enable seeding. By default this is a leech-only client",
+    )
     return parser.parse_args()
 
 
@@ -96,6 +101,11 @@ def main():
     settings['enable_dht'] = False
     settings['active_tracker_limit'] = 0 # disable trackers?
     # settings['allow_multiple_connections_per_ip'] = True # only needed in btcache
+    if not args.enable_seeding:
+        # disable seeding per session
+        settings['upload_rate_limit'] = 0
+        settings['enable_incoming_utp'] = False
+        settings['enable_incoming_tcp'] = False
 
     ses = lt.session(settings)
 
@@ -107,6 +117,9 @@ def main():
     atp.flags &= ~lt.torrent_flags.auto_managed
     atp.flags &= ~lt.torrent_flags.paused  # start immediately
     atp.trackers = []  # no trackers
+    if not args.enable_seeding:
+        # disable seeding per torrent
+        atp.upload_mode = True
     th = ses.add_torrent(atp)
 
     # manually add the peer
