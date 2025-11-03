@@ -350,6 +350,9 @@ def main():
 
     if args.write_config:
         default_config = BTCacheConfig()
+        settings = lt.default_settings()
+        settings.update(default_config.torrent_settings)
+        default_config.torrent_settings = dict(settings)
         with open(args.write_config, "w") as f:
             yaml.safe_dump(asdict(default_config), f, sort_keys=False)
         print(f"writing {args.write_config}")
