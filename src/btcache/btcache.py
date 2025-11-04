@@ -7,6 +7,7 @@ A caching BitTorrent client running as a proxy between hidden seeders and public
 
 import os
 import re
+import io
 import sys
 import time
 import socket
@@ -20,7 +21,11 @@ import itertools
 
 import requests
 import libtorrent as lt
-import yaml
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap
+
+yaml = YAML()
+yaml.indent(mapping=2, sequence=4, offset=2)
 
 
 # ---------------------------------------------------------------------
@@ -51,9 +56,8 @@ class BTCacheConfig:
     @staticmethod
     def from_yaml(path: str) -> "BTCacheConfig":
         with open(path, "r") as f:
-            data = yaml.safe_load(f) or {}
+            data = yaml.load(f) or {}
         return BTCacheConfig(**data)
-
 
 # ---------------------------------------------------------------------
 # BTCache main class
@@ -329,6 +333,19 @@ def compress_ranges(indices):
     return "[" + ", ".join(ranges) + "]"
 
 
+def yaml_scalar(value) -> str:
+    """Render a Python value as a one-line YAML literal."""
+    buf = io.StringIO()
+    y = YAML(typ='safe')
+    y.default_flow_style = False
+    # dump as a key in a dummy mapping
+    # so ruamel doesn't add document markers (trailing '...')
+    y.dump({'v': value}, buf)
+    text = buf.getvalue().strip()
+    # extract the value portion after 'v: '
+    return text.split(': ', 1)[1].strip()
+
+
 # ----------------------------------------------------------------------
 # CLI entrypoint
 # ----------------------------------------------------------------------
@@ -350,11 +367,24 @@ def main():
 
     if args.write_config:
         default_config = BTCacheConfig()
-        settings = lt.default_settings()
-        settings.update(default_config.torrent_settings)
-        default_config.torrent_settings = dict(settings)
+        lt_defaults = lt.default_settings()
+        data = asdict(default_config)
+        # comment default values
+        ts_map = CommentedMap()
+        # non-default settings first
+        for k, v in data["torrent_settings"].items():
+            ts_map[k] = v
+            if k in lt_defaults:
+                default_yaml = yaml_scalar(lt_defaults[k])
+                ts_map.yaml_add_eol_comment(f"default: {default_yaml}", key=k)
+        data["torrent_settings"] = ts_map
         with open(args.write_config, "w") as f:
-            yaml.safe_dump(asdict(default_config), f, sort_keys=False)
+            yaml.dump(data, f)
+            # default settings second
+            for k, v in lt_defaults.items():
+                v_yaml = yaml_scalar(v)
+                if k not in ts_map:
+                    f.write(f"  # {k}: {v_yaml} # default: {v_yaml}\n")
         print(f"writing {args.write_config}")
         sys.exit(0)
 
