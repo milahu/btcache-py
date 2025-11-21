@@ -119,7 +119,7 @@ def main():
     atp.trackers = []  # no trackers
     if not args.enable_seeding:
         # disable seeding per torrent
-        atp.upload_mode = True
+        atp.upload_limit = 0
     th = ses.add_torrent(atp)
 
     # manually add the peer
