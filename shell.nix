@@ -7,7 +7,7 @@ pkgs.mkShell {
     (python3.withPackages (pp: with pp; [
       libtorrent-rasterbar
       requests
-      ruamel_yaml # ruamel.yaml
+      ruamel-yaml # ruamel.yaml
       torf
     ]))
   ];
