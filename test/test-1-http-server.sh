@@ -23,7 +23,7 @@ echo "path: ${path@Q}"
 mkdir -p "$htdocs/$path"
 
 # infohash of test/zero.100mib.bin.torrent
-btih=c073aea984f91fcc0080efc181bd2290ce060fc0
+btih=8204399284901c93fc3e024138c7be4288ecb96e
 
 mkdir -p "$htdocs/cas/btih/$btih"
 
