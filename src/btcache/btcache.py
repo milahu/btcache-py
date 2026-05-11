@@ -25,6 +25,12 @@ import libtorrent as lt
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 
+# # debug: print all alert types
+# for key in dir(lt):
+#     if key.endswith("_alert"):
+#         print(f"lt.{key}")
+# raise 5
+
 yaml = YAML()
 yaml.indent(mapping=2, sequence=4, offset=2)
 
@@ -132,6 +138,8 @@ class BTCache:
         self.logger = self._get_logger()
         self.session = self._create_session()
 
+        self.cache_size = parse_size(self.config.cache_size)
+
         if config.allowed_ips:
             self.logger.info(f"setting ip filter: allowing peers {config.allowed_ips}")
             self.session.set_ip_filter(get_ip_filter_of_allowed_peers(config.allowed_ips))
@@ -148,6 +156,14 @@ class BTCache:
 
         self.torrent_handles: dict[str, list[lt.torrent_handle]] = {}
         self.uploaded_pieces_by_torrent_handle: dict[lt.torrent_handle, list[bool]] = {}
+        self.peer_have_pieces: dict[lt.torrent_handle, dict[str, list[bool]]] = {}
+        self.active_prefetch: dict[lt.torrent_handle, set[int]] = {}
+        self.uploaded_piece_time: dict[lt.torrent_handle, list[float]] = {}
+        self.piece_last_access: dict[lt.torrent_handle, list[float]] = {}
+
+        self.monitor_torrent_last_msg = None
+        self.fetch_pieces_last_msg = None
+        self.monitor_peer_info_alert_last_msg = {}
 
     # ------------------------------------------------------------------
     # Logging setup
@@ -178,21 +194,22 @@ class BTCache:
         # Enable alerts
         settings["alert_mask"] = (
             0
-            # lt.alert.category_t.status_notification # incoming_connection_alert
+            | lt.alert.category_t.status_notification
             | lt.alert.category_t.error_notification
             # peer_connect_alert
             # peer_disconnected_alert
-            # | lt.alert.category_t.connect_notification
+            | lt.alert.category_t.connect_notification
             # peer_snubbed_alert
             # peer_blocked_alert
             | lt.alert.category_t.peer_notification
-            # | lt.alert.category_t.peer_log_notification # peer_log_alert
+            | lt.alert.category_t.peer_log_notification
             | lt.alert.category_t.storage_notification
             # | lt.alert.category_t.tracker_notification
-            # | lt.alert.category_t.piece_progress_notification # piece_finished_alert
+            | lt.alert.category_t.piece_progress_notification
+            | lt.alert.category_t.progress_notification
             | lt.alert.category_t.upload_notification # block_uploaded_alert
             | lt.alert.category_t.performance_warning
-            # | lt.alert.category_t.all_categories # debug
+            | lt.alert.category_t.all_categories # debug
         )
         if debug_alerts:
             # NOTE alerts are dropped when too many
@@ -276,20 +293,99 @@ class BTCache:
 
         th = self.session.add_torrent(atp)
 
+        # no, this has no effect here
+        # we have to wait until the torrent is actually seeding in state_changed_alert
+        # self.enable_super_seeding(th)
+
         # TODO use bitfield
         self.uploaded_pieces_by_torrent_handle[th] = [False] * ti.num_pieces()
+
+        self.peer_have_pieces[th] = dict()
+
+        self.active_prefetch[th] = set()
+
+        # TODO? instead of time=0, use the current time if we have pieces
+        self.uploaded_piece_time[th] = [0] * ti.num_pieces()
+        self.piece_last_access[th] = [0] * ti.num_pieces()
+
+        # no. re-use the "have pieces" bitfield
+        # FIXME ...but evicted pieces are detected with a delay
+        # self.cached_pieces[th] = [False] * ti.num_pieces()
 
         th.resume()
 
         status = th.status()
-        self.logger.info(f"Torrent status after session.add_torrent: state={status.state} progress={status.progress} bytes={status.total_wanted}")
+        self.logger.info(f"Torrent status after session.add_torrent: state={status.state} progress={status.progress:.2%} bytes={status.total_wanted}")
 
         th.prioritize_pieces([0] * ti.num_pieces())
 
         status = th.status()
-        self.logger.info(f"Torrent status after th.prioritize_pieces: state={status.state} progress={status.progress} bytes={status.total_wanted}")
+        self.logger.info(f"Torrent status after th.prioritize_pieces: state={status.state} progress={status.progress:.2%} bytes={status.total_wanted}")
 
         return th
+
+    def evict_piece(self, th, piece):
+        ti = th.torrent_file()
+        btih = ti.info_hashes().v1
+        self.logger.info(f"torrent {btih}: Evicting piece {piece}")
+
+        # disable future downloading
+        th.piece_priority(piece, 0)
+
+        # libtorrent should no longer advertise the piece to peers
+        # remove piece from the "have pieces" bitfield
+        # FIXME remove piece from all caches
+        r'''
+        Your future dedicated C++ API should ideally also evict:
+
+        - read cache
+        - write cache
+        - hash cache
+
+        for those pieces.
+
+        FIXME dont change piece priorities in forget_pieces
+        '''
+        # NOTE this requires a patched libtorrent with
+        # void torrent::forget_pieces(std::vector<piece_index_t> const& pieces)
+        # https://github.com/milahu/libtorrent/tree/add-forget_pieces-force_recheck_pieces
+        th.forget_pieces([piece])
+
+        # remove piece from disk cache
+        th.flush_cache()
+
+        fs = ti.files()
+        piece_size = ti.piece_size(piece)
+
+        remaining = piece_size
+        piece_offset = 0
+
+        while remaining > 0:
+
+            mapping = ti.map_block(piece, piece_offset, remaining)
+
+            file_index = mapping.file_index
+            file_offset = mapping.offset
+            length = mapping.length
+
+            rel_path = fs.file_path(file_index)
+            full_path = os.path.join(download_root, rel_path)
+
+            fd = os.open(full_path, os.O_RDWR)
+            flags = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE
+            try:
+                # no, we want to immediately free up the disk space
+                # # corrupt first bytes
+                # # os.pwrite(fd, os.urandom(16), offset)
+                # os.pwrite(fd, os.urandom(100), offset)
+
+                # punch hole into file
+                fallocate(fd, flags, file_offset, length)
+            finally:
+                os.close(fd)
+
+            remaining -= length
+            piece_offset += length
 
     # ------------------------------------------------------------------
     # Peer management
@@ -327,17 +423,34 @@ class BTCache:
                 for th in th_list:
                     self.monitor_torrent(th, host)
 
+            self.evict_old_pieces()
+
             time.sleep(cfg.poll_interval)
 
     def monitor_alerts(self, alerts):
+        now = time.time()
         for a in alerts:
-            if isinstance(a, lt.peer_info_alert):
+            if isinstance(a, lt.peer_info_alert): # status_notification
                 # self.logger.debug("peer_info_alert")
                 self.monitor_peer_info_alert(a)
+            elif isinstance(a, lt.state_changed_alert): # status_notification
+                self.logger.debug(f"state_changed_alert: a.state: {a.prev_state} -> {a.state}")
+                if a.state.seeding:
+                    self.enable_super_seeding(a.handle)
             elif isinstance(a, lt.block_uploaded_alert):
+                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
                 ip, port = a.ip
+                self.uploaded_piece_time[a.handle][a.piece_index] = now
+                # TODO? wait until the full piece has been uploaded
+                self.active_prefetch[a.handle].discard(a.piece_index)
                 if self.uploaded_pieces_by_torrent_handle[a.handle][a.piece_index]:
+                    # this piece has already started uploading
                     continue
+
+                # TODO? wait until the full piece has been uploaded
+                peer_id = f"{ip}:{port}"
+                self.peer_have_pieces[a.handle][peer_id][a.piece_index] = True
+
                 # self.logger.debug(f"block_uploaded_alert: torrent={a.handle.torrent_file().info_hashes().v1} piece={a.piece_index} block={a.block_index} peer={ip}:{port}")
                 # assume a piece was uploaded when one of its pieces was uploaded
                 # we cannot be more strict here
@@ -346,7 +459,7 @@ class BTCache:
                 self.uploaded_pieces_by_torrent_handle[a.handle][a.piece_index] = True
                 # trigger next incremental fetch
                 self.fetch_pieces(a.handle, a.ip)
-            elif isinstance(a, lt.peer_connect_alert):
+            elif isinstance(a, lt.peer_connect_alert): # connect_notification
                 # too early. no handshake. no bitfield exchange
                 ip, port = getattr(a, "ip", None)
                 self.logger.debug(f"peer_connect_alert: peer={ip}:{port} torrent={a.handle.torrent_file().info_hashes().v1}")
@@ -354,12 +467,14 @@ class BTCache:
             #     # too early. no handshake. no a.handle
             #     ip, port = getattr(a, "ip", None)
             #     self.logger.debug(f"incoming_connection_alert: peer={ip}:{port}")
-            elif isinstance(a, lt.peer_disconnected_alert):
+            elif isinstance(a, lt.peer_disconnected_alert): # connect_notification
                 ip, port = getattr(a, "ip", None)
                 self.logger.debug(f"peer_disconnected_alert: peer={ip}:{port} torrent={a.handle.torrent_file().info_hashes().v1}")
             elif isinstance(a, lt.peer_snubbed_alert):
+                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
                 self.logger.debug(f"peer_snubbed_alert: peer={a.ip}")
             elif isinstance(a, lt.peer_blocked_alert):
+                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
                 self.logger.debug(f"peer_blocked_alert: peer={a.ip}")
                 if 0:
                     # get alert category
@@ -371,14 +486,89 @@ class BTCache:
             # elif isinstance(a, lt.piece_availability_alert):
             #     # Swarm-wide piece availability
             #     self.logger.debug(f"piece_availability_alert: piece={a.piece_index} num_peers={a.num_peers}")
-            # elif isinstance(a, lt.peer_log_alert):
-            #     self.logger.debug(f"peer_log_alert: msg={a.msg()!r} peers={peers}")
+            elif isinstance(a, lt.peer_log_alert): # peer_log_notification
+                # self.logger.debug(f"peer_log_alert: {a.message()}")
+                msg = a.message()
+                # remove infohash and peer
+                msg = re.sub(r"^.*? peer \[ [0-9.:]+ client: .*? \]( \[[0-9.:]+\])? ", "", msg)
+                if re.search(r"HAVE|INTEREST|CHOKE", msg):
+                    self.logger.info(f"peer_log: {msg}")
             # elif isinstance(a, lt.block_finished_alert):
             #     # a block finished downloading
             #     self.logger.debug(f"block_finished_alert: torrent={a.handle.torrent_file().info_hashes().v1} piece={a.piece_index} peers={a.handle.get_peer_info()}")
-            # elif isinstance(a, lt.piece_finished_alert):
-            #     # a piece finished downloading and passed the hash check
-            #     self.logger.debug(f"piece_finished_alert: torrent={a.handle.torrent_file().info_hashes().v1} piece={a.piece_index} peers={a.handle.get_peer_info()}") # dir(a)={dir(a)}
+            elif isinstance(a, lt.piece_finished_alert): # piece_progress_notification progress_notification
+                # a piece finished downloading and passed the hash check
+                self.logger.debug(f"piece_finished_alert: torrent={a.handle.torrent_file().info_hashes().v1} piece={a.piece_index} peers={a.handle.get_peer_info()}") # dir(a)={dir(a)}
+                th = a.handle
+
+                # no! download != upload
+                # TODO? remove in favor of peer_have_pieces
+                # self.uploaded_pieces_by_torrent_handle[th][a.piece_index] = True
+
+                # 'handle', 'message', 'piece_index', 'torrent_name', 'what'
+                # self.logger.debug(f"piece_finished_alert: a={dir(a)}")
+                # self.logger.debug(f"piece_finished_alert: message={a.message()}")
+
+                # no! download != upload
+                # TODO? remove in favor of uploaded_pieces_by_torrent_handle
+                # peer_id = f""
+                # self.peer_have_pieces[th][peer_id][piece] = True
+
+                # no! download != upload
+                # self.active_prefetch[th].discard(a.piece_index)
+
+                # TODO remove? fetch_pieces should only be called on upload activity (block_uploaded_alert)
+                # self.fetch_pieces(a.handle, a.ip) # AttributeError: 'piece_finished_alert' object has no attribute 'ip'
+                self.fetch_pieces(a.handle)
+
+                # no! download != upload
+                # piece = a.piece_index
+                # ti = th.torrent_file()
+                # size = ti.piece_size(piece)
+                # # self.cached_pieces[th] = size
+                # self.piece_last_access[th] = time.time()
+
+
+
+            # debug: not fetching from seeder
+
+            # redundant with block_finished_alert
+            # elif isinstance(a, lt.block_downloading_alert):
+            #     if a.block_index == 0:
+            #         self.logger.debug(f"block_downloading_alert: torrent={a.handle.torrent_file().info_hashes().v1} piece={a.piece_index} block={a.block_index} peer={ip}:{port}")
+
+            # redundant with piece_finished_alert
+            # elif isinstance(a, lt.block_finished_alert):
+            #     # TODO what is the last block index?
+            #     # piece_size / block_size
+            #     if a.block_index == 0:
+            #         self.logger.debug(f"block_finished_alert: torrent={a.handle.torrent_file().info_hashes().v1} piece={a.piece_index} block={a.block_index} peer={ip}:{port}")
+
+            elif isinstance(a, lt.block_timeout_alert):
+                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
+                ip, port = getattr(p, "ip", None)
+                self.logger.debug(f"block_timeout_alert: torrent={a.handle.torrent_file().info_hashes().v1} piece={a.piece_index} block={a.block_index} peer={ip}:{port}")
+
+            elif isinstance(a, lt.peer_connect_alert):
+                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
+                self.logger.debug(f"peer_connect_alert: {a.message()}")
+
+            elif isinstance(a, lt.peer_disconnected_alert):
+                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
+                self.logger.debug(f"peer_disconnected_alert: {a.message()}")
+
+            elif isinstance(a, lt.peer_error_alert):
+                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
+                self.logger.debug(f"peer_error_alert: {a.message()}")
+
+            elif isinstance(a, lt.peer_snubbed_alert):
+                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
+                self.logger.debug(f"peer_snubbed_alert: {a.message()}")
+
+            elif isinstance(a, lt.peer_unsnubbed_alert):
+                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
+                self.logger.debug(f"peer_unsnubbed_alert: {a.message()}")
+
             elif debug_alerts:
                 # Log all alerts for debugging
                 s = f"{type(a).__name__}: {a}"
@@ -394,17 +584,68 @@ class BTCache:
         # called from peer_info_alert
         th = a.handle
         peers = th.get_peer_info()
-        # self.logger.debug(f"monitor_peer_info_alert: peers={peers}")
+        # update self.peer_have_pieces before calling self.fetch_pieces
         for p in peers:
             ip, port = getattr(p, "ip", None)
-            self.logger.debug(f"monitor_peer_info_alert: peer={ip}:{port} choked={getattr(p,'remote_choked',None)} interested={getattr(p,'remote_interested',None)} pieces={compress_bool_ranges(p.pieces)}")
+            self.peer_have_pieces[th][f"{ip}:{port}"] = list(p.pieces)
+        for p in peers:
+            ip, port = getattr(p, "ip", None)
+            peer_id = f"{ip}:{port}"
+            flags = p.flags
+            msg = (
+                f"monitor_peer_info_alert:"
+                f" peer={peer_id}"
+                f" pieces={compress_bool_ranges(p.pieces)}"
+                f" interesting={bool(flags & lt.peer_info.interesting)}"
+                f" choked={bool(flags & lt.peer_info.choked)}"
+                f" remote_interested={bool(flags & lt.peer_info.remote_interested)}"
+                f" remote_choked={bool(flags & lt.peer_info.remote_choked)}"
+            )
+            if msg != self.monitor_peer_info_alert_last_msg.get(peer_id):
+                self.logger.debug(msg)
+                self.monitor_peer_info_alert_last_msg[peer_id] = msg
+
+            # TODO remove? fetch_pieces should only be called on upload activity (block_uploaded_alert)
             # FIXME move this to "Connected peer" -> initial fetch of pieces
             # TODO? call fetch_pieces
             # this is the only event where we get the "haves" bitfield from peers
             # and this is fired only once after the bitfield exchange
             self.fetch_pieces(th, p.ip, p.pieces)
 
-    def fetch_pieces(self, torrent_handle, peer_ip, peer_pieces=None):
+    def enable_super_seeding(self, th):
+        # enable super seeding mode
+        # so we never send upload_only=1 to leechers
+        # which would cause leechers to disconnect for 60 seconds
+        # so we would need
+        # max_incremental_fetch_size: 300MiB # 5MiB/s * 60s
+
+        # https://libtorrent.org/reference-Core.html#torrent_flags_t::super_seeding
+        # sets the torrent into super seeding/initial seeding mode.
+        # If the torrent is not a seed, this flag has no effect.
+        #
+        # so we have to wait until the torrent is actually seeding
+        # and then we have to call th.set_flags(flags)
+
+        # https://github.com/arvidn/libtorrent/issues/4570
+        # Today we have super seeding and
+        # this mechanism gives out 1 piece at a time
+        # until it spreads in the cluster and then the client moves on
+        #
+        # problem: that "one piece" is random
+        # and can be a piece we dont even have! -> bug in libtorrent
+        # https://github.com/arvidn/libtorrent/issues/8355
+        # super seeding mode is advertising random pieces it does not have
+        flags = th.flags()
+        super_seeding = flags & lt.torrent_flags.super_seeding
+        if super_seeding != 0:
+            return
+        # th.set_super_seeding(True) # deprecated
+        btih = th.torrent_file().info_hashes().v1
+        self.logger.debug(f"enable_super_seeding: enabling super_seeding for {btih}")
+        flags |= lt.torrent_flags.super_seeding
+        th.set_flags(flags)
+
+    def fetch_pieces(self, torrent_handle, peer_ip=None, peer_pieces=None):
         # FIXME this can be called from
         #   monitor_peer_info_alert
         #   block_uploaded_alert
@@ -412,8 +653,13 @@ class BTCache:
         # then new pieces are added too fast
         # so this should be limited by uploaded_pieces
         th = torrent_handle
-        ip, port = peer_ip
-        if peer_pieces:
+
+        # TODO remove
+        # self.enable_super_seeding(th)
+
+        ip, port = peer_ip or ("?", "?")
+        # if peer_pieces:
+        if 0:
             # the peer just connected
             # called from monitor_peer_info_alert
             # this is called only once per peer
@@ -428,6 +674,9 @@ class BTCache:
                 self.logger.info(f"fetch_pieces: seeder peer {ip}:{port} seed={is_seed} missing={missing_piece_ranges}")
                 return
             self.logger.info(f"fetch_pieces: leecher peer {ip}:{port} seed={is_seed} missing={missing_piece_ranges}")
+        elif peer_ip:
+            # self.logger.info(f"fetch_pieces: called from block_uploaded_alert")
+            pass
         else:
             # the peer just downloaded a block
             # called from block_uploaded_alert
@@ -444,16 +693,29 @@ class BTCache:
             # anyway, this would require patching libtorrent
             # https://github.com/bittorrent/bittorrent.org/pull/176
             # draft BEP: Want Bitfields of Leech-Only Clients
-            self.logger.info(f"fetch_pieces: called from block_uploaded_alert")
-            uploaded_pieces = self.uploaded_pieces_by_torrent_handle[th]
-            missing_pieces = []
-            for piece in range(th.torrent_file().num_pieces()):
-                done = uploaded_pieces[piece]
-                if not done:
-                    missing_pieces.append(piece)
+            # self.logger.info(f"fetch_pieces: called from piece_finished_alert")
+            pass
+
+        uploaded_pieces = self.uploaded_pieces_by_torrent_handle[th]
+        missing_pieces = []
+        for piece in range(th.torrent_file().num_pieces()):
+            done = uploaded_pieces[piece]
+            if not done:
+                missing_pieces.append(piece)
+
         current_priorities = [th.piece_priority(i) for i in range(th.torrent_file().num_pieces())]
-        self.logger.info(f"fetch_pieces: missing_pieces={compress_ranges(missing_pieces)} current_priorities={compress_bool_ranges(current_priorities)}")
+        msg = (
+            f"fetch_pieces:"
+            f" missing_pieces={compress_ranges(missing_pieces)}"
+            f" current_priorities={compress_bool_ranges(current_priorities)}"
+            f" active_prefetch={compress_ranges(self.active_prefetch[th])}"
+        )
+        if msg != self.fetch_pieces_last_msg:
+            self.logger.info(msg)
+            self.fetch_pieces_last_msg = msg
         to_fetch = []
+        r'''
+        # FIXME current_priorities is growing too fast
         for i in missing_pieces:
             if current_priorities[i] == 0:
                 current_priorities[i] = 1
@@ -464,6 +726,47 @@ class BTCache:
             self.logger.info(f"fetch_pieces: Fetching pieces from hidden peers: {compress_ranges(to_fetch)}")
             th.prioritize_pieces(current_priorities)
             self.ensure_hidden_peers_connected(th)
+        r'''
+        # active = self.active_prefetch.setdefault(th, set())
+        active = self.active_prefetch[th]
+        uploaded = self.uploaded_pieces_by_torrent_handle[th]
+        # candidates = anything not yet served AND not already active
+        # candidates = [
+        #     i for i, done in enumerate(uploaded)
+        #     if not done and i not in active
+        # ]
+
+        num_pieces = th.torrent_file().num_pieces()
+        piece_popularity = [0] * num_pieces
+        for peer_pieces in self.peer_have_pieces[th].values():
+            for i, has in enumerate(peer_pieces):
+                if not has:
+                    piece_popularity[i] += 1
+
+        candidates = [
+            i for i in range(num_pieces)
+            if piece_popularity[i] > 0
+            and i not in active
+        ]
+
+        candidates.sort(
+            key=lambda i: piece_popularity[i],
+            reverse=True,
+        )
+
+        # choose up to budget
+        budget = self.config.max_incremental_fetch - len(active)
+        to_add = candidates[:budget]
+
+        if to_add:
+            for i in to_add:
+                self.logger.info(f"fetch_pieces: adding piece {i}")
+                active.add(i)
+                current_priorities[i] = 1
+            th.prioritize_pieces(current_priorities)
+            # th.resume()
+            # th.force_reannounce()
+            th.connect_peer(("127.0.0.1", 6882)) # force peer state refresh? # no effect, or even worse
 
     def monitor_torrent(self, th, host):
         try:
@@ -485,24 +788,85 @@ class BTCache:
             # Compress ranges for readability
             enabled_ranges = compress_ranges(enabled_indices)
             have_ranges = compress_ranges(have_indices)
+            active_prefetch_ranges = compress_ranges(self.active_prefetch[th])
 
             # Compute byte-level progress
             total = status.total_wanted
             done = status.total_wanted_done
             percent = (done / total * 100) if total > 0 else 0.0
 
-            self.logger.info(
-                f"monitor_torrent: "
-                f"host={host}: btih={btih} state={status.state} "
-                f"progress={done}/{total} bytes ({percent:.2f}%) "
-                f"enabled={enabled_ranges} have={have_ranges}"
+            msg = (
+                f"monitor_torrent: host={host}:"
+                f" btih={btih}"
+                f" state={status.state}"
+                f" progress={done}/{total} bytes ({percent:.2f}%)"
+                f" enabled={enabled_ranges}"
+                f" have={have_ranges}"
+                f" active_prefetch={active_prefetch_ranges}"
+                f" num_peers={th.status().num_peers}"
+                f" num_seeds={th.status().num_seeds}"
             )
+            if msg != self.monitor_torrent_last_msg:
+                self.logger.info(msg)
+                self.monitor_torrent_last_msg = msg
 
             if str(status.state) == "downloading":
                 self.ensure_hidden_peers_connected(th)
 
         except Exception as e:
             self.logger.info(f"Error fetching status for torrent: {e}")
+
+    def evict_old_pieces(self):
+        total = self.cached_bytes()
+        if total <= self.cache_size:
+            return
+        candidates = []
+        now = time.time()
+        for th, timestamps in self.uploaded_piece_time.items():
+            ti = th.torrent_file()
+            for piece, last_access in enumerate(timestamps):
+                # skip uncached pieces
+                if not th.have_piece(piece):
+                    continue
+                # never evict active downloads
+                if th.piece_priority(piece) != 0:
+                    continue
+                r'''
+                TODO maybe also honor minimum_residency_time
+                self.min_piece_age = 30
+                if now - last_access < self.min_piece_age:
+                    continue
+                '''
+                r'''
+                TODO
+                # never evict pieces currently being uploaded
+                recently_uploaded[piece] = now
+                if piece in currently_requested_pieces:
+                    continue
+                '''
+                age = now - last_access
+                candidates.append((age, th, piece))
+        candidates.sort(reverse=True)
+        for age, th, piece in candidates:
+            if total <= self.cache_size:
+                break
+            size = th.torrent_file().piece_size(piece)
+            self.evict_piece(th, piece)
+            total -= size
+
+    def cached_bytes(self):
+        total = 0
+        for th in self.uploaded_piece_time.keys():
+            ti = th.torrent_file()
+            if ti is None:
+                continue
+            st = th.status()
+            pieces = st.pieces
+            for piece, have in enumerate(pieces):
+                if not have:
+                    continue
+                total += ti.piece_size(piece)
+        return total
 
     # ------------------------------------------------------------------
     # Main control
@@ -606,6 +970,74 @@ format_size = lambda n:(
     (len(bin(int(n)))-1)//10
     )
 )+"B"
+
+
+# https://gist.github.com/NicolasT/1194957
+
+import ctypes
+import ctypes.util
+
+c_off_t = ctypes.c_int64
+
+def make_fallocate():
+    libc_name = ctypes.util.find_library('c')
+    libc = ctypes.CDLL(libc_name)
+
+    _fallocate = libc.fallocate
+    _fallocate.restype = ctypes.c_int
+    _fallocate.argtypes = [ctypes.c_int, ctypes.c_int, c_off_t, c_off_t]
+
+    del libc
+    del libc_name
+
+    def fallocate(fd, mode, offset, len_):
+        res = _fallocate(fd.fileno(), mode, offset, len_)
+        if res != 0:
+            raise IOError(res, 'fallocate')
+
+    return fallocate
+
+fallocate = make_fallocate()
+del make_fallocate
+
+FALLOC_FL_KEEP_SIZE = 0x01
+FALLOC_FL_PUNCH_HOLE = 0x02
+
+r'''
+def main(db):
+    orig_data = ''.join(chr(i) for i in xrange(10))
+    format_ = lambda s: [ord(c) for c in s]
+
+    with open(db, 'w') as fd:
+        fd.write(orig_data)
+
+    with open(db, 'r') as fd:
+        data = fd.read()
+        print 'Original value:', format_(data)
+
+    print 'Punching hole at offset 2, length 3'
+    with open(db, 'a') as fd:
+        fallocate(fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, 2, 3)
+
+    print 'Reading file'
+    with open(db, 'r') as fd:
+        data = fd.read()
+        print 'New value:', format_(data)
+'''
+
+
+def category_names(mask: int):
+    names = []
+    for name in dir(lt.alert.category_t):
+        if name.startswith('_'):
+            continue
+        val = getattr(lt.alert.category_t, name)
+        # Values in category_t are ints, ignore non-ints
+        if isinstance(val, int) and (mask & val):
+            names.append(name)
+    if "all_categories" in names:
+        names.remove("all_categories")
+    return names
 
 
 # ----------------------------------------------------------------------

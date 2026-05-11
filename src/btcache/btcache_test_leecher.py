@@ -17,6 +17,7 @@ import libtorrent as lt
 POLL_INTERVAL = 1.0
 
 debug_alerts = 0
+debug_alerts = 1
 
 ignore_alert_types = (
     lt.tracker_error_alert,
@@ -251,6 +252,9 @@ def main():
     logger.info(f"Listening on {args.listen}, trying to connect to peer {peer_ip}:{peer_port}")
     logger.info(f"Infohash: {btih_hex}")
 
+    last_msg = None
+    last_peer_msg = {}
+
     while True:
 
         # # manually add the peer
@@ -291,7 +295,9 @@ def main():
                     logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
                     logger.error(f"Peer error: {get_message(a)}")
                 elif isinstance(a, lt.peer_log_alert): # peer_log_notification
-                    logger.info(f"Peer log: {get_message(a)}")
+                    msg = get_message(a)
+                    if re.search(r"HAVE|INTEREST|CHOKE", msg):
+                        logger.info(f"Peer log: {msg}")
                 elif isinstance(a, lt.torrent_error_alert):
                     logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
                     logger.error(f"Torrent error: {a.message()}")
@@ -352,17 +358,30 @@ def main():
 
             done_pieces = len(list(filter(lambda x: x, status.pieces)))
 
-            logger.info(
+            msg = (
                 f"state={status.state} progress={done}/{total} bytes ({percent:.2f}%) "
                 f"fetching_pieces={compressed}"
                 f" done_pieces={done_pieces}/{len(status.pieces)}"
             )
+            if msg != last_msg:
+                logger.info(msg)
+                last_msg = msg
 
             for p in peers:
                 ip, port = getattr(p, "ip", None)
-                interested = getattr(p, "remote_interested", False)
-                choked = getattr(p, "remote_choked", False)
-                logger.info(f"  peer={ip}:{port} interested={interested} choked={choked}")
+                peer_id = f"{ip}:{port}"
+                flags = p.flags
+                msg = (
+                    # f" "
+                    f" peer={peer_id}"
+                    f" interesting={bool(flags & lt.peer_info.interesting)}"
+                    f" choked={bool(flags & lt.peer_info.choked)}"
+                    f" remote_interested={bool(flags & lt.peer_info.remote_interested)}"
+                    f" remote_choked={bool(flags & lt.peer_info.remote_choked)}"
+                )
+                if msg != last_peer_msg.get(peer_id):
+                    logger.info(msg)
+                    last_peer_msg[peer_id] = msg
 
         except Exception as e:
             logger.info(f"Error querying peers: {e}")

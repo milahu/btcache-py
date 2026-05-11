@@ -183,7 +183,7 @@ def main():
             lt.alert.category_t.status_notification
             | lt.alert.category_t.error_notification
             | lt.alert.category_t.peer_notification
-            # | lt.alert.category_t.peer_log_notification # peer_log_alert
+            | lt.alert.category_t.peer_log_notification # peer_log_alert
             | lt.alert.category_t.storage_notification
             | lt.alert.category_t.tracker_notification
             | lt.alert.category_t.performance_warning
@@ -258,12 +258,22 @@ def main():
     logger.info(f"Listening on {args.listen}")
 
     try:
+        last_msg = None
         while True:
             status = th.status()
             peers = th.get_peer_info()
-            logger.info(f"Seeding torrent: btih={th.info_hash()} state={status.state} peers={peers} uploaded={status.total_upload}")
+            msg = (
+                f"Seeding torrent:"
+                f" btih={th.info_hash()}"
+                f" state={status.state}"
+                f" peers={peers}"
+                f" uploaded={status.total_upload}"
+            )
+            if msg != last_msg:
+                logger.info(msg)
+                last_msg = msg
             for p in peers:
-                ip = getattr(p, "ip", None)
+                ipclient:getattr(p, "ip", None)
                 pieces_bitfield = getattr(p, "pieces", [])
                 missing_pieces = [i for i, has in enumerate(pieces_bitfield) if not has]
                 missing_piece_ranges = compress_ranges(missing_pieces)
@@ -286,7 +296,9 @@ def main():
                         logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
                         logger.error(f"Peer error: {get_message(a)}")
                     elif isinstance(a, lt.peer_log_alert): # peer_log_notification
-                        logger.info(f"Peer log: {get_message(a)}")
+                        msg = get_message(a)
+                        if re.search(r"HAVE|INTEREST|CHOKE", msg):
+                            logger.info(f"Peer log: {msg}")
                     elif isinstance(a, lt.torrent_error_alert):
                         logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
                         logger.error(f"Torrent error: {a.message()}")
