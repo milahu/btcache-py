@@ -1,0 +1,24 @@
+hidden_peers:
+  -
+    hostname: "localhost"
+    torrent_dir_urls: ["http://127.0.0.1:8012/cas/btih/"]
+    cas_urls: ["http://127.0.0.1:8012/cas/"]
+    torrent_peers: ["127.0.0.1:6880"]
+allowed_ips: ["127.0.0.1"]
+# listen: 0.0.0.0:6881
+listen: 127.0.0.1:6881
+cache_dir: btcache-torrents
+cache_size: 10MiB
+cas_path: null
+save_dir: btcache-downloads
+poll_interval: 1.0
+# max_incremental_fetch_size: 16MiB # TODO
+max_incremental_fetch: 3
+torrent_settings:
+  enable_dht: false
+  enable_upnp: false
+  enable_natpmp: false
+  enable_lsd: false
+  allow_multiple_connections_per_ip: true
+  active_tracker_limit: 0
+  allow_i2p_mixed: True
