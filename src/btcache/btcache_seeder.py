@@ -273,11 +273,11 @@ def main():
                 logger.info(msg)
                 last_msg = msg
             for p in peers:
-                ipclient:getattr(p, "ip", None)
+                ip, port = getattr(p, "ip", None)
                 pieces_bitfield = getattr(p, "pieces", [])
                 missing_pieces = [i for i, has in enumerate(pieces_bitfield) if not has]
                 missing_piece_ranges = compress_ranges(missing_pieces)
-                logger.info(f"  peer {ip} missing pieces: {missing_piece_ranges}")
+                logger.info(f"  peer {ip}:{port} missing pieces: {missing_piece_ranges}")
 
             def get_message(alert):
                 message = alert.message()
