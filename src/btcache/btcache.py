@@ -162,7 +162,6 @@ class BTCache:
         self.piece_last_access: dict[lt.torrent_handle, list[float]] = {}
 
         self.monitor_torrent_last_msg = None
-        self.fetch_pieces_last_msg = None
         self.monitor_peer_info_alert_last_msg = {}
 
     # ------------------------------------------------------------------
@@ -216,7 +215,22 @@ class BTCache:
             settings["alert_mask"] |= lt.alert.category_t.all_categories
         # settings["send_redundant_have"] = True # send HAVE even if peer already knows
         # settings["lazy_bitfields"] = False # send full bitfield immediately on connect
-        return lt.session(settings)
+
+        # no, share_mode breaks downloading. why?!
+        # https://www.libtorrent.org/reference-Settings.html#share_mode_target
+        # for lt.torrent_flags.share_mode
+        # default: 3
+        # settings["share_mode_target"] = (2**63-1) # INT64_MAX = 9223372036854775807
+
+        if 0:
+            # debug: default config
+            alert_mask = settings["alert_mask"]
+            settings = lt.default_settings()
+            settings["alert_mask"] = alert_mask
+
+        ses = lt.session(settings)
+
+        return ses
 
     # ------------------------------------------------------------------
     # Torrent fetch and cache
@@ -282,14 +296,47 @@ class BTCache:
         atp = lt.add_torrent_params()
         atp.ti = ti
         atp.save_path = save_path
+
+        # the whole point of btcache is
+        # to run a bittorrent client with limited disk space
+        # so of course we use storage_mode_sparse
         atp.storage_mode = lt.storage_mode_t.storage_mode_sparse
+
+        # disable peer exchange
+        # to not leak the hidden_peers
         # TODO add session parameter pex_ip_filter
         # https://github.com/arvidn/libtorrent/issues/8059
         atp.flags |= lt.torrent_flags.disable_pex
-        atp.flags &= ~lt.torrent_flags.auto_managed
-        # atp.flags &= ~lt.torrent_flags.paused
+
+        atp.flags &= ~lt.torrent_flags.auto_managed # TODO what
+
+        # no, upload_mode breaks downloading. why?!
+        # atp.flags |= lt.torrent_flags.upload_mode # TODO what
+
         # atp.flags |= lt.torrent_flags.paused  # start paused
+        # atp.flags &= ~lt.torrent_flags.paused  # start immediately
+
+        atp.flags |= lt.torrent_flags.sequential_download
+
         # atp.flags &= ~lt.torrent_flags.has_metadata
+
+        # no, share_mode breaks downloading. why?!
+        # https://libtorrent.org/reference-Core.html#torrent_flags_t::share_mode
+        # share_mode determines if the torrent should be added in share mode or not.
+        # Share mode indicates that we are not interested in downloading the torrent,
+        # but merely want to improve our share ratio (i.e. increase it).
+        #
+        # we enable share_mode
+        # to prevent libtorrent from sending upload_only messages
+        # to prevent leechers from disconnecting with
+        # UPLOAD_ONLY [ the peer is upload-only and we're not interested in it ]
+        # atp.flags |= lt.torrent_flags.share_mode
+
+        if 0:
+            # debug: default config
+            atp = lt.add_torrent_params()
+            atp.ti = ti
+            atp.save_path = save_path
 
         th = self.session.add_torrent(atp)
 
@@ -316,11 +363,6 @@ class BTCache:
 
         status = th.status()
         self.logger.info(f"Torrent status after session.add_torrent: state={status.state} progress={status.progress:.2%} bytes={status.total_wanted}")
-
-        th.prioritize_pieces([0] * ti.num_pieces())
-
-        status = th.status()
-        self.logger.info(f"Torrent status after th.prioritize_pieces: state={status.state} progress={status.progress:.2%} bytes={status.total_wanted}")
 
         return th
 
@@ -435,10 +477,13 @@ class BTCache:
                 self.monitor_peer_info_alert(a)
             elif isinstance(a, lt.state_changed_alert): # status_notification
                 self.logger.debug(f"state_changed_alert: a.state: {a.prev_state} -> {a.state}")
-                if a.state.seeding:
-                    self.enable_super_seeding(a.handle)
-            elif isinstance(a, lt.block_uploaded_alert):
-                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
+                # if a.state.seeding:
+                #     self.enable_super_seeding(a.handle)
+
+            elif isinstance(a, lt.listen_succeeded_alert): # status_notification
+                continue
+
+            elif isinstance(a, lt.block_uploaded_alert): # progress_notification upload_notification
                 ip, port = a.ip
                 self.uploaded_piece_time[a.handle][a.piece_index] = now
                 # TODO? wait until the full piece has been uploaded
@@ -447,9 +492,9 @@ class BTCache:
                     # this piece has already started uploading
                     continue
 
-                # TODO? wait until the full piece has been uploaded
-                peer_id = f"{ip}:{port}"
-                self.peer_have_pieces[a.handle][peer_id][a.piece_index] = True
+                # # TODO? wait until the full piece has been uploaded
+                # peer_id = f"{ip}:{port}"
+                # self.peer_have_pieces[a.handle][peer_id][a.piece_index] = True
 
                 # self.logger.debug(f"block_uploaded_alert: torrent={a.handle.torrent_file().info_hashes().v1} piece={a.piece_index} block={a.block_index} peer={ip}:{port}")
                 # assume a piece was uploaded when one of its pieces was uploaded
@@ -473,8 +518,7 @@ class BTCache:
             elif isinstance(a, lt.peer_snubbed_alert):
                 self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
                 self.logger.debug(f"peer_snubbed_alert: peer={a.ip}")
-            elif isinstance(a, lt.peer_blocked_alert):
-                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
+            elif isinstance(a, lt.peer_blocked_alert): # ip_block_notification
                 self.logger.debug(f"peer_blocked_alert: peer={a.ip}")
                 if 0:
                     # get alert category
@@ -490,15 +534,30 @@ class BTCache:
                 # self.logger.debug(f"peer_log_alert: {a.message()}")
                 msg = a.message()
                 # remove infohash and peer
-                msg = re.sub(r"^.*? peer \[ [0-9.:]+ client: .*? \]( \[[0-9.:]+\])? ", "", msg)
-                if re.search(r"HAVE|INTEREST|CHOKE", msg):
+                if 0:
+                    # show peer log alerts only from this peer
+                    leecher_peer = "127.0.0.1:6882"
+                    if not f"peer [ {leecher_peer} client:" in msg:
+                        continue
+                # msg = re.sub(r"^.*? peer \[ [0-9.:]+ client: .*? \]( \[[0-9.:]+\])? ", "", msg)
+                # if 1: # debug
+                if re.search(r"HAVE|INTEREST|CHOKE|EXTENDED_HANDSHAKE", msg):
                     self.logger.info(f"peer_log: {msg}")
+
+                # if "==> EXTENDED_HANDSHAKE" in msg: # send
+                # if "<== EXTENDED_HANDSHAKE" in msg: # receive
+
             # elif isinstance(a, lt.block_finished_alert):
             #     # a block finished downloading
             #     self.logger.debug(f"block_finished_alert: torrent={a.handle.torrent_file().info_hashes().v1} piece={a.piece_index} peers={a.handle.get_peer_info()}")
             elif isinstance(a, lt.piece_finished_alert): # piece_progress_notification progress_notification
                 # a piece finished downloading and passed the hash check
-                self.logger.debug(f"piece_finished_alert: torrent={a.handle.torrent_file().info_hashes().v1} piece={a.piece_index} peers={a.handle.get_peer_info()}") # dir(a)={dir(a)}
+                self.logger.debug(
+                    f"piece_finished_alert:"
+                    f" torrent={a.handle.torrent_file().info_hashes().v1}"
+                    f" piece={a.piece_index}"
+                    # f" peers={a.handle.get_peer_info()}" # libtorrent.peer_info object
+                )
                 th = a.handle
 
                 # no! download != upload
@@ -519,7 +578,7 @@ class BTCache:
 
                 # TODO remove? fetch_pieces should only be called on upload activity (block_uploaded_alert)
                 # self.fetch_pieces(a.handle, a.ip) # AttributeError: 'piece_finished_alert' object has no attribute 'ip'
-                self.fetch_pieces(a.handle)
+                # self.fetch_pieces(a.handle)
 
                 # no! download != upload
                 # piece = a.piece_index
@@ -646,127 +705,7 @@ class BTCache:
         th.set_flags(flags)
 
     def fetch_pieces(self, torrent_handle, peer_ip=None, peer_pieces=None):
-        # FIXME this can be called from
-        #   monitor_peer_info_alert
-        #   block_uploaded_alert
-        # but when called from monitor_peer_info_alert
-        # then new pieces are added too fast
-        # so this should be limited by uploaded_pieces
-        th = torrent_handle
-
-        # TODO remove
-        # self.enable_super_seeding(th)
-
-        ip, port = peer_ip or ("?", "?")
-        # if peer_pieces:
-        if 0:
-            # the peer just connected
-            # called from monitor_peer_info_alert
-            # this is called only once per peer
-            # fetch the first N missing pieces
-            self.logger.info(f"fetch_pieces: called from monitor_peer_info_alert")
-            is_seed = all(peer_pieces)
-            # NOTE leech-only clients will never "have" any pieces
-            # so we cannot reliably predict which pieces they will request next
-            missing_pieces = [i for i, has in enumerate(peer_pieces) if not has]
-            missing_piece_ranges = compress_ranges(missing_pieces)
-            if is_seed:
-                self.logger.info(f"fetch_pieces: seeder peer {ip}:{port} seed={is_seed} missing={missing_piece_ranges}")
-                return
-            self.logger.info(f"fetch_pieces: leecher peer {ip}:{port} seed={is_seed} missing={missing_piece_ranges}")
-        elif peer_ip:
-            # self.logger.info(f"fetch_pieces: called from block_uploaded_alert")
-            pass
-        else:
-            # the peer just downloaded a block
-            # called from block_uploaded_alert
-            # fetch the next N missing pieces
-            # FIXME this only works when the leecher needs all pieces in order
-            # we would have to lie ("we have all pieces")
-            # to know which pieces the leecher actually needs
-            # we could do "limited lying"
-            # by slowly expanding our "have" bitfield
-            # until the leecher starts requesting pieces
-            # then we fetch the pieces from hidden seeders
-            # and deliver the pieces to the leecher
-            # and continue to expand our "have" bitfield
-            # anyway, this would require patching libtorrent
-            # https://github.com/bittorrent/bittorrent.org/pull/176
-            # draft BEP: Want Bitfields of Leech-Only Clients
-            # self.logger.info(f"fetch_pieces: called from piece_finished_alert")
-            pass
-
-        uploaded_pieces = self.uploaded_pieces_by_torrent_handle[th]
-        missing_pieces = []
-        for piece in range(th.torrent_file().num_pieces()):
-            done = uploaded_pieces[piece]
-            if not done:
-                missing_pieces.append(piece)
-
-        current_priorities = [th.piece_priority(i) for i in range(th.torrent_file().num_pieces())]
-        msg = (
-            f"fetch_pieces:"
-            f" missing_pieces={compress_ranges(missing_pieces)}"
-            f" current_priorities={compress_bool_ranges(current_priorities)}"
-            f" active_prefetch={compress_ranges(self.active_prefetch[th])}"
-        )
-        if msg != self.fetch_pieces_last_msg:
-            self.logger.info(msg)
-            self.fetch_pieces_last_msg = msg
-        to_fetch = []
-        r'''
-        # FIXME current_priorities is growing too fast
-        for i in missing_pieces:
-            if current_priorities[i] == 0:
-                current_priorities[i] = 1
-                to_fetch.append(i)
-            if len(to_fetch) >= self.config.max_incremental_fetch:
-                break
-        if to_fetch:
-            self.logger.info(f"fetch_pieces: Fetching pieces from hidden peers: {compress_ranges(to_fetch)}")
-            th.prioritize_pieces(current_priorities)
-            self.ensure_hidden_peers_connected(th)
-        r'''
-        # active = self.active_prefetch.setdefault(th, set())
-        active = self.active_prefetch[th]
-        uploaded = self.uploaded_pieces_by_torrent_handle[th]
-        # candidates = anything not yet served AND not already active
-        # candidates = [
-        #     i for i, done in enumerate(uploaded)
-        #     if not done and i not in active
-        # ]
-
-        num_pieces = th.torrent_file().num_pieces()
-        piece_popularity = [0] * num_pieces
-        for peer_pieces in self.peer_have_pieces[th].values():
-            for i, has in enumerate(peer_pieces):
-                if not has:
-                    piece_popularity[i] += 1
-
-        candidates = [
-            i for i in range(num_pieces)
-            if piece_popularity[i] > 0
-            and i not in active
-        ]
-
-        candidates.sort(
-            key=lambda i: piece_popularity[i],
-            reverse=True,
-        )
-
-        # choose up to budget
-        budget = self.config.max_incremental_fetch - len(active)
-        to_add = candidates[:budget]
-
-        if to_add:
-            for i in to_add:
-                self.logger.info(f"fetch_pieces: adding piece {i}")
-                active.add(i)
-                current_priorities[i] = 1
-            th.prioritize_pieces(current_priorities)
-            # th.resume()
-            # th.force_reannounce()
-            th.connect_peer(("127.0.0.1", 6882)) # force peer state refresh? # no effect, or even worse
+        pass
 
     def monitor_torrent(self, th, host):
         try:

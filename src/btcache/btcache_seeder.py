@@ -170,6 +170,7 @@ def main():
     settings['enable_natpmp'] = False
     settings['enable_lsd'] = False
     settings['enable_dht'] = args.enable_dht
+    settings["allow_multiple_connections_per_ip"] = True
     if not args.enable_trackers:
         # TODO implement the setting enable_trackers in libtorrent
         # https://github.com/arvidn/libtorrent/issues/8050
@@ -266,7 +267,7 @@ def main():
                 f"Seeding torrent:"
                 f" btih={th.info_hash()}"
                 f" state={status.state}"
-                f" peers={peers}"
+                # f" peers={peers}" # [<libtorrent.peer_info object>]
                 f" uploaded={status.total_upload}"
             )
             if msg != last_msg:
@@ -297,7 +298,7 @@ def main():
                         logger.error(f"Peer error: {get_message(a)}")
                     elif isinstance(a, lt.peer_log_alert): # peer_log_notification
                         msg = get_message(a)
-                        if re.search(r"HAVE|INTEREST|CHOKE", msg):
+                        if re.search(r"HAVE|INTEREST|CHOKE|EXTENDED_HANDSHAKE", msg):
                             logger.info(f"Peer log: {msg}")
                     elif isinstance(a, lt.torrent_error_alert):
                         logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")

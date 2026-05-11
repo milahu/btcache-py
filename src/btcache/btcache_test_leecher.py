@@ -17,7 +17,6 @@ import libtorrent as lt
 POLL_INTERVAL = 1.0
 
 debug_alerts = 0
-debug_alerts = 1
 
 ignore_alert_types = (
     lt.tracker_error_alert,
@@ -164,6 +163,7 @@ def main():
     settings['enable_lsd'] = False
     settings['enable_dht'] = args.enable_dht
     settings['active_tracker_limit'] = 0 # disable trackers?
+    settings["allow_multiple_connections_per_ip"] = True
     # settings['allow_multiple_connections_per_ip'] = True # only needed in btcache
     if not args.enable_seeding:
         # disable seeding per session
@@ -175,11 +175,11 @@ def main():
     if debug_alerts:
         # Enable alerts
         settings["alert_mask"] = (
-            lt.alert.category_t.status_notification
+            0 
+            | lt.alert.category_t.status_notification
             | lt.alert.category_t.error_notification
             | lt.alert.category_t.peer_notification
             | lt.alert.category_t.torrent_log_notification
-            | lt.alert.category_t.status_notification
             | lt.alert.category_t.stats_notification
             | lt.alert.category_t.peer_log_notification # peer_log_alert # verbose
             | lt.alert.category_t.storage_notification
@@ -210,7 +210,6 @@ def main():
             | lt.alert.category_t.progress_notification
             | lt.alert.category_t.session_log_notification
             | lt.alert.category_t.stats_notification
-            | lt.alert.category_t.status_notification
             | lt.alert.category_t.storage_notification
             | lt.alert.category_t.torrent_log_notification
             | lt.alert.category_t.tracker_notification
@@ -241,6 +240,12 @@ def main():
     th = ses.add_torrent(atp)
     # th.set_upload_limit(0) # override session upload_limit
 
+    # default?
+    # if atp.ti:
+    #     th.prioritize_pieces([1] * atp.ti.num_pieces())
+    # else:
+    #     pass
+    #     # TODO later: call th.prioritize_pieces
 
     if not args.enable_seeding:
         # leech-only client
@@ -248,6 +253,7 @@ def main():
 
     # manually add the peer
     th.connect_peer((peer_ip, peer_port))
+    dt_connect_peer = 0
 
     logger.info(f"Listening on {args.listen}, trying to connect to peer {peer_ip}:{peer_port}")
     logger.info(f"Infohash: {btih_hex}")
@@ -255,10 +261,21 @@ def main():
     last_msg = None
     last_peer_msg = {}
 
+    connect_peer_time = 0
+    done_connect_peer = False
+
     while True:
 
         # # manually add the peer
         # th.connect_peer((peer_ip, peer_port))
+
+        # if not done_connect_peer:
+        #     if dt_connect_peer == connect_peer_time:
+        #         logger.info(f"connecting to peer {peer_ip}:{peer_port}")
+        #         th.connect_peer((peer_ip, peer_port))
+        #         done_connect_peer = True
+        #     else:
+        #         dt_connect_peer += 1
 
         def category_names(mask: int):
             names = []
@@ -296,8 +313,11 @@ def main():
                     logger.error(f"Peer error: {get_message(a)}")
                 elif isinstance(a, lt.peer_log_alert): # peer_log_notification
                     msg = get_message(a)
+                    # if 1: # debug
                     if re.search(r"HAVE|INTEREST|CHOKE", msg):
                         logger.info(f"Peer log: {msg}")
+                    # if "<== EXTENDED_HANDSHAKE" in msg:
+                    #     raise 555
                 elif isinstance(a, lt.torrent_error_alert):
                     logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
                     logger.error(f"Torrent error: {a.message()}")
@@ -312,6 +332,13 @@ def main():
                     # logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
                     # logger.debug(f"Piece finished: piece={a.piece_index}")
                     pass
+                elif isinstance(a, lt.state_changed_alert): # status_notification
+                    logger.debug(f"state_changed_alert: a.state: {a.prev_state} -> {a.state}")
+                    # if a.state.seeding:
+                    #     self.enable_super_seeding(a.handle)
+                    # TODO
+                    # if has metadata
+                    #   prioritize_pieces(1)
                 elif isinstance(a, lt.state_update_alert):
                     # logger.debug(f"state_update_alert")
                     # requested by ses.post_torrent_updates()
