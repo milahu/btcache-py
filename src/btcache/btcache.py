@@ -230,6 +230,38 @@ class BTCache:
 
         ses = lt.session(settings)
 
+        # in case ignore_limits_on_local_network is removed one day...
+        r'''
+        ignore_limits_on_local_network = settings.get("ignore_limits_on_local_network", True)
+        if "ignore_limits_on_local_network" in settings:
+            del settings["ignore_limits_on_local_network"]
+
+        if ignore_limits_on_local_network == False:
+
+            # https://github.com/arvidn/libtorrent/issues/8356
+            # document rate-limiting of local peers
+
+            # also apply upload_rate_limit and download_rate_limit
+            # to peers on the local network
+            # based on libtorrent/bindings/python/test.py
+
+            # settings = ses.get_settings()
+
+            # define limits for the default global class
+            pci = ses.get_peer_class(lt.session.global_peer_class_id)
+            pci["upload_limit"] = settings["upload_rate_limit"]
+            pci["download_limit"] = settings["download_rate_limit"]
+            ses.set_peer_class(lt.session.global_peer_class_id, pci)
+
+            # force all peers into class 0
+            pcf = lt.peer_class_type_filter()
+            # all TCP peers
+            pcf.add(lt.peer_class_type_filter.tcp_socket, lt.session.global_peer_class_id)
+            # all UDP peers
+            pcf.add(lt.peer_class_type_filter.utp_socket, lt.session.global_peer_class_id)
+            ses.set_peer_class_type_filter(pcf)
+        '''
+
         return ses
 
     # ------------------------------------------------------------------

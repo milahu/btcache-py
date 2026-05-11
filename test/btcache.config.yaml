@@ -14,6 +14,7 @@ save_dir: btcache-downloads
 poll_interval: 1.0
 # max_incremental_fetch_size: 16MiB # TODO
 max_incremental_fetch: 3
+# https://www.libtorrent.org/reference-Settings.html
 torrent_settings:
   enable_dht: false
   enable_upnp: false
@@ -22,3 +23,7 @@ torrent_settings:
   allow_multiple_connections_per_ip: true
   active_tracker_limit: 0
   allow_i2p_mixed: True
+  download_rate_limit: 1048576 # 1 MiB/s
+  upload_rate_limit: 1048576 # 1 MiB/s
+  # fix: By default peers on the local network are not rate limited.
+  ignore_limits_on_local_network: false
