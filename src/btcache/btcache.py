@@ -35,6 +35,13 @@ yaml = YAML()
 yaml.indent(mapping=2, sequence=4, offset=2)
 
 debug_alerts = 0
+# debug_alerts = 1
+
+debug_peer_log_alerts = 0
+# debug_peer_log_alerts = 1
+
+debug_all_alerts = 0
+# debug_all_alerts = 1
 
 ignore_alert_types = (
     lt.tracker_error_alert,
@@ -119,6 +126,14 @@ class BTCacheConfig:
         # "enable_natpmp": False,
         # "enable_lsd": False,
         "allow_multiple_connections_per_ip": True,
+        "active_tracker_limit": 0,
+        "download_rate_limit": 1024**3, # 1 GiB/s
+        "upload_rate_limit": 1024**3, # 1 GiB/s
+        "allow_multiple_connections_per_ip": True,
+        # fix: By default peers on the local network are not rate limited.
+        "ignore_limits_on_local_network": False,
+        # fix: performance_alert: performance warning: download limit too low (upload rate will suffer)
+        "rate_limit_ip_overhead": False,
     })
 
     @staticmethod
@@ -138,7 +153,7 @@ class BTCache:
         self.logger = self._get_logger()
         self.session = self._create_session()
 
-        self.cache_size = parse_size(self.config.cache_size)
+        self.cache_size = int(parse_size(self.config.cache_size))
 
         if config.allowed_ips:
             self.logger.info(f"setting ip filter: allowing peers {config.allowed_ips}")
@@ -154,15 +169,27 @@ class BTCache:
                 port = int(port)
                 peer["torrent_peers"][torrent_peer_idx] = (host, port)
 
+        # TODO rename to self.torrent_handles_by_host
         self.torrent_handles: dict[str, list[lt.torrent_handle]] = {}
         self.uploaded_pieces_by_torrent_handle: dict[lt.torrent_handle, list[bool]] = {}
         self.peer_have_pieces: dict[lt.torrent_handle, dict[str, list[bool]]] = {}
         self.active_prefetch: dict[lt.torrent_handle, set[int]] = {}
         self.uploaded_piece_time: dict[lt.torrent_handle, list[float]] = {}
         self.piece_last_access: dict[lt.torrent_handle, list[float]] = {}
+        self.cached_pieces: dict[lt.torrent_handle, dict[str, list[bool]]] = {}
+        self.active_torrents: set[lt.torrent_handle] = set()
+        self.cache_full: bool = False
+        self.last_upload_time: dict[lt.torrent_handle, float] = {}
+        self.last_activity: dict[lt.torrent_handle, float] = {}
+        self.todo_set_piece_priority_1: dict[lt.torrent_handle, dict[int, float]] = {}
+        self.todo_deactivate_torrent: dict[lt.torrent_handle, float] = {}
+
+        # self.piece_refcount[th]     # number of peers needing piece
+        # self.torrent_activity[th]   # popularity score
 
         self.monitor_torrent_last_msg = None
         self.monitor_peer_info_alert_last_msg = {}
+        self.fetch_pieces_last_msg = None
 
     # ------------------------------------------------------------------
     # Logging setup
@@ -387,9 +414,10 @@ class BTCache:
         self.uploaded_piece_time[th] = [0] * ti.num_pieces()
         self.piece_last_access[th] = [0] * ti.num_pieces()
 
-        # no. re-use the "have pieces" bitfield
-        # FIXME ...but evicted pieces are detected with a delay
-        # self.cached_pieces[th] = [False] * ti.num_pieces()
+        # TODO self.cached_pieces[th] = bitarray(...)
+        self.cached_pieces[th] = [False] * ti.num_pieces()
+
+        self.todo_set_piece_priority_1[th] = {}
 
         th.resume()
 
@@ -400,66 +428,107 @@ class BTCache:
 
     def evict_piece(self, th, piece):
         ti = th.torrent_file()
-        btih = ti.info_hashes().v1
-        self.logger.info(f"torrent {btih}: Evicting piece {piece}")
+        btih = str(ti.info_hashes().v1)
 
         # disable future downloading
+        # low priority but NOT zero
+        # th.piece_priority(piece, 1)
+        # prevent immediate redownload
         th.piece_priority(piece, 0)
-
-        # libtorrent should no longer advertise the piece to peers
-        # remove piece from the "have pieces" bitfield
-        # FIXME remove piece from all caches
-        r'''
-        Your future dedicated C++ API should ideally also evict:
-
-        - read cache
-        - write cache
-        - hash cache
-
-        for those pieces.
-
-        FIXME dont change piece priorities in forget_pieces
-        '''
-        # NOTE this requires a patched libtorrent with
-        # void torrent::forget_pieces(std::vector<piece_index_t> const& pieces)
-        # https://github.com/milahu/libtorrent/tree/add-forget_pieces-force_recheck_pieces
-        th.forget_pieces([piece])
+        # later: th.piece_priority(piece, 1)
+        later = time.time() + 10 # 10 seconds in the future
+        self.todo_set_piece_priority_1[th][piece] = later
 
         # remove piece from disk cache
-        th.flush_cache()
+        # th.flush_cache()
+
+        download_root = th.status().save_path
 
         fs = ti.files()
         piece_size = ti.piece_size(piece)
+
+        # self.logger.info(f"Evicting piece {piece}: {piece_size} bytes")
 
         remaining = piece_size
         piece_offset = 0
 
         while remaining > 0:
 
-            mapping = ti.map_block(piece, piece_offset, remaining)
+            file_slice_list = ti.map_block(piece, piece_offset, remaining)
 
-            file_index = mapping.file_index
-            file_offset = mapping.offset
-            length = mapping.length
+            for file_slice_idx, file_slice in enumerate(file_slice_list):
 
-            rel_path = fs.file_path(file_index)
-            full_path = os.path.join(download_root, rel_path)
+                rel_path = fs.file_path(file_slice.file_index)
+                full_path = os.path.join(download_root, rel_path)
 
-            fd = os.open(full_path, os.O_RDWR)
-            flags = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE
-            try:
-                # no, we want to immediately free up the disk space
-                # # corrupt first bytes
-                # # os.pwrite(fd, os.urandom(16), offset)
-                # os.pwrite(fd, os.urandom(100), offset)
+                self.logger.info(
+                    f"Evicting piece {piece}:"
+                    f" file={rel_path!r}"
+                    f" offset={file_slice.offset}"
+                    f" size={file_slice.size}"
+                )
 
-                # punch hole into file
-                fallocate(fd, flags, file_offset, length)
-            finally:
-                os.close(fd)
+                debug_file_size = True
 
-            remaining -= length
-            piece_offset += length
+                if debug_file_size:
+                    st_before = os.stat(full_path)
+
+                # punch hole into file to free up disk space
+                # TODO optimize this for consecutive pieces
+                # FIXME verify reduced file size
+                fd = os.open(full_path, os.O_RDWR)
+                flags = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE
+                try:
+                    fallocate(fd, flags, file_slice.offset, file_slice.size)
+                    if debug_file_size:
+                        os.fsync(fd)
+                finally:
+                    os.close(fd)
+
+                if debug_file_size:
+                    # NOTE libtorrent can modify the file
+                    # between st_before and fallocate and st_after
+                    # so we cannot rely on the stat data
+                    st_after = os.stat(full_path)
+                    self.logger.info(
+                        f"Evicting piece {piece}:"
+                        f" blocks before={st_before.st_blocks}"
+                        f" after={st_after.st_blocks}"
+                    )
+
+                remaining -= file_slice.size
+                piece_offset += file_slice.size
+
+        # TODO remove?
+        # force libtorrent to read this piece
+        # so libtorrent can see that this piece is missing
+        # NOTE this does not force libtorrent to actually read the piece from disk
+        # instead, libtorrent can read the piece from the RAM cache
+        # th.read_piece(piece)
+
+        self.cached_pieces[th][piece] = False
+
+    def piece_exists_on_disk(self, th, piece):
+        ti = th.torrent_file()
+        fs = ti.files()
+        save_path = th.status().save_path
+        piece_size = ti.piece_size(piece)
+        offset = 0
+        remaining = piece_size
+        while remaining > 0:
+            for fslice in ti.map_block(piece, offset, remaining):
+                rel = fs.file_path(fslice.file_index)
+                path = os.path.join(save_path, rel)
+                try:
+                    st = os.stat(path)
+                    # hole-punched files may still exist but be sparse
+                    if st.st_size == 0:
+                        return False
+                except FileNotFoundError:
+                    return False
+                remaining -= fslice.size
+                offset += fslice.size
+        return True
 
     # ------------------------------------------------------------------
     # Peer management
@@ -471,6 +540,8 @@ class BTCache:
             return None
 
     def ensure_hidden_peers_connected(self, th: lt.torrent_handle):
+        # TODO call this less often
+        # once per second may be too much
         all_torrent_peers = []
         for peer in self.config.hidden_peers:
             all_torrent_peers += peer["torrent_peers"]
@@ -489,6 +560,12 @@ class BTCache:
     # ------------------------------------------------------------------
     def monitor_loop(self):
         cfg = self.config
+
+        last_pressure_update = 0
+        last_cleanup = 0
+        last_set_piece_priority_1 = 0
+        last_cache_trim = 0
+
         while True:
             alerts = self.session.pop_alerts()
             self.monitor_alerts(alerts)
@@ -497,7 +574,24 @@ class BTCache:
                 for th in th_list:
                     self.monitor_torrent(th, host)
 
-            self.evict_old_pieces()
+            now = time.time()
+            if now - last_pressure_update > 5:
+                self.update_cache_pressure()
+                last_pressure_update = now
+
+            now = time.time()
+            if now - last_cleanup > 30:
+                self.cleanup_inactive_torrents()
+                last_cleanup = now
+
+            if now - last_cache_trim > 30:
+                self.trim_cache_hard()
+                last_cache_trim = now
+
+            now = time.time()
+            if now - last_set_piece_priority_1 > 10:
+                self.set_piece_priority_1()
+                last_set_piece_priority_1 = now
 
             time.sleep(cfg.poll_interval)
 
@@ -517,7 +611,9 @@ class BTCache:
 
             elif isinstance(a, lt.block_uploaded_alert): # progress_notification upload_notification
                 ip, port = a.ip
+                th = a.handle
                 self.uploaded_piece_time[a.handle][a.piece_index] = now
+                self.last_upload_time[th] = now
                 # TODO? wait until the full piece has been uploaded
                 self.active_prefetch[a.handle].discard(a.piece_index)
                 if self.uploaded_pieces_by_torrent_handle[a.handle][a.piece_index]:
@@ -539,17 +635,25 @@ class BTCache:
             elif isinstance(a, lt.peer_connect_alert): # connect_notification
                 # too early. no handshake. no bitfield exchange
                 ip, port = getattr(a, "ip", None)
-                self.logger.debug(f"peer_connect_alert: peer={ip}:{port} torrent={a.handle.torrent_file().info_hashes().v1}")
+                th = a.handle
+                btih = str(th.torrent_file().info_hashes().v1)
+                self.logger.debug(f"peer_connect_alert: peer={ip}:{port} btih={btih[:7]}")
+                # a.pid = peer ID = 0 for anonymous peers
+                # self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
+                # no have pieces bitfield here
             # elif isinstance(a, lt.incoming_connection_alert):
             #     # too early. no handshake. no a.handle
             #     ip, port = getattr(a, "ip", None)
             #     self.logger.debug(f"incoming_connection_alert: peer={ip}:{port}")
             elif isinstance(a, lt.peer_disconnected_alert): # connect_notification
                 ip, port = getattr(a, "ip", None)
-                self.logger.debug(f"peer_disconnected_alert: peer={ip}:{port} torrent={a.handle.torrent_file().info_hashes().v1}")
-            elif isinstance(a, lt.peer_snubbed_alert):
-                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
+                th = a.handle
+                btih = str(th.torrent_file().info_hashes().v1)
+                self.logger.debug(f"peer_disconnected_alert: peer={ip}:{port} btih={btih[:7]}")
+            elif isinstance(a, lt.peer_snubbed_alert): # peer_notification
                 self.logger.debug(f"peer_snubbed_alert: peer={a.ip}")
+                # FIXME peer_snubbed_alert: peer=('127.0.0.1', 6880)
+                # what?
             elif isinstance(a, lt.peer_blocked_alert): # ip_block_notification
                 self.logger.debug(f"peer_blocked_alert: peer={a.ip}")
                 if 0:
@@ -571,26 +675,54 @@ class BTCache:
                     leecher_peer = "127.0.0.1:6882"
                     if not f"peer [ {leecher_peer} client:" in msg:
                         continue
+
+                # msg = msg.replace("==> ", "out ==> ").replace(">>> ", "out >>> ")
+                # msg = msg.replace("<== ", "inn <== ").replace("<<< ", "inn <<< ")
+                # msg = msg.replace("*** ", "nfo *** ")
+
                 # msg = re.sub(r"^.*? peer \[ [0-9.:]+ client: .*? \]( \[[0-9.:]+\])? ", "", msg)
-                # if 1: # debug
-                if re.search(r"HAVE|INTEREST|CHOKE|EXTENDED_HANDSHAKE", msg):
-                    self.logger.info(f"peer_log: {msg}")
+                msg = re.sub(r"^.*? peer \[ ([0-9.:]+) client: .*? \]( \[([0-9.:]+)\])? ", r"peer=\1 ", msg)
+                if debug_peer_log_alerts:
+                    self.logger.info(f"peer_log_alert: {msg}")
+                elif re.search(r"HAVE|INTEREST|CHOKE|EXTENDED_HANDSHAKE", msg):
+                    self.logger.info(f"peer_log_alert: {msg}")
 
                 # if "==> EXTENDED_HANDSHAKE" in msg: # send
                 # if "<== EXTENDED_HANDSHAKE" in msg: # receive
 
-            # elif isinstance(a, lt.block_finished_alert):
-            #     # a block finished downloading
-            #     self.logger.debug(f"block_finished_alert: torrent={a.handle.torrent_file().info_hashes().v1} piece={a.piece_index} peers={a.handle.get_peer_info()}")
+            elif isinstance(a, lt.block_finished_alert):
+                # a block finished downloading
+                continue
+                th = a.handle
+                btih = str(th.torrent_file().info_hashes().v1)
+                self.logger.debug(f"block_finished_alert: btih={btih[:7]} piece={a.piece_index} peers={a.handle.get_peer_info()}")
             elif isinstance(a, lt.piece_finished_alert): # piece_progress_notification progress_notification
                 # a piece finished downloading and passed the hash check
+                th = a.handle
+                btih = str(th.torrent_file().info_hashes().v1)
                 self.logger.debug(
                     f"piece_finished_alert:"
-                    f" torrent={a.handle.torrent_file().info_hashes().v1}"
+                    f" btih={btih[:7]}"
                     f" piece={a.piece_index}"
                     # f" peers={a.handle.get_peer_info()}" # libtorrent.peer_info object
                 )
+
                 th = a.handle
+                piece = a.piece_index
+
+                self.cached_pieces[th][piece] = True
+                self.active_prefetch[th].discard(piece)
+                self.uploaded_piece_time[th][piece] = time.time()
+
+                # keep piece "interesting"
+                # NOTE dont set priority to zero
+                # because that would remove the piece from our "have pieces" bitfield
+                # and leechers would think we are not interesting and disconnect
+                th.piece_priority(piece, 1)
+
+                self.evict_old_pieces()
+
+                self.update_cache_pressure()
 
                 # no! download != upload
                 # TODO? remove in favor of peer_have_pieces
@@ -626,41 +758,43 @@ class BTCache:
             # redundant with block_finished_alert
             # elif isinstance(a, lt.block_downloading_alert):
             #     if a.block_index == 0:
-            #         self.logger.debug(f"block_downloading_alert: torrent={a.handle.torrent_file().info_hashes().v1} piece={a.piece_index} block={a.block_index} peer={ip}:{port}")
+            #         th = a.handle
+            #         btih = str(th.torrent_file().info_hashes().v1)
+            #         self.logger.debug(f"block_downloading_alert: btih={btih[:7]} piece={a.piece_index} block={a.block_index} peer={ip}:{port}")
 
             # redundant with piece_finished_alert
             # elif isinstance(a, lt.block_finished_alert):
             #     # TODO what is the last block index?
             #     # piece_size / block_size
             #     if a.block_index == 0:
-            #         self.logger.debug(f"block_finished_alert: torrent={a.handle.torrent_file().info_hashes().v1} piece={a.piece_index} block={a.block_index} peer={ip}:{port}")
+            #         th = a.handle
+            #         btih = str(th.torrent_file().info_hashes().v1)
+            #         self.logger.debug(f"block_finished_alert: btih={btih[:7]} piece={a.piece_index} block={a.block_index} peer={ip}:{port}")
 
+            # block_progress_notification peer_notification progress_notification
             elif isinstance(a, lt.block_timeout_alert):
-                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
-                ip, port = getattr(p, "ip", None)
-                self.logger.debug(f"block_timeout_alert: torrent={a.handle.torrent_file().info_hashes().v1} piece={a.piece_index} block={a.block_index} peer={ip}:{port}")
-
-            elif isinstance(a, lt.peer_connect_alert):
-                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
-                self.logger.debug(f"peer_connect_alert: {a.message()}")
-
-            elif isinstance(a, lt.peer_disconnected_alert):
-                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
-                self.logger.debug(f"peer_disconnected_alert: {a.message()}")
+                ip, port = getattr(a, "ip", None)
+                th = a.handle
+                btih = str(th.torrent_file().info_hashes().v1)
+                self.logger.debug(f"block_timeout_alert: btih={btih[:7]} piece={a.piece_index} block={a.block_index} peer={ip}:{port}")
 
             elif isinstance(a, lt.peer_error_alert):
                 self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
                 self.logger.debug(f"peer_error_alert: {a.message()}")
 
-            elif isinstance(a, lt.peer_snubbed_alert):
-                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
-                self.logger.debug(f"peer_snubbed_alert: {a.message()}")
-
-            elif isinstance(a, lt.peer_unsnubbed_alert):
-                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
+            elif isinstance(a, lt.peer_unsnubbed_alert): # peer_notification
                 self.logger.debug(f"peer_unsnubbed_alert: {a.message()}")
 
-            elif debug_alerts:
+            elif isinstance(a, lt.performance_alert): # performance_warning
+                self.logger.debug(f"performance_alert: {a.message()}")
+
+            elif isinstance(a, lt.torrent_log_alert): # torrent_log_notification
+                self.logger.debug(f"torrent_log_alert: {a.msg()}")
+
+            elif isinstance(a, lt.log_alert): # session_log_notification
+                self.logger.debug(f"log_alert: {a.message()}")
+
+            elif debug_all_alerts:
                 # Log all alerts for debugging
                 s = f"{type(a).__name__}: {a}"
                 ignore_alert = False
@@ -669,7 +803,27 @@ class BTCache:
                         ignore_alert = True
                         break
                 if ignore_alert: continue
-                self.logger.debug(f"ALERT {type(a).__name__}: {a}")
+                # self.logger.debug(f"ALERT {type(a).__name__}: {a}")
+                self.logger.debug(f"ALERT {type(a).__name__}: category={category_names(a.category())} dir={dir(a)}")
+
+            r'''
+            # block_progress_notification progress_notification
+            elif isinstance(a, lt.block_downloading_alert):
+                self.logger.debug(f"block_downloading_alert: {a.message()}")
+
+            elif isinstance(a, lt.picker_log_alert): # picker_log_notification
+                self.logger.debug(f"picker_log_alert: {a.message()}")
+
+            elif isinstance(a, lt.alert): # incoming_request_notification
+                continue
+                if re.search(r": \[\d+\] \d+ \d+ \d+ \d+ \d+ \d+ \d+ \d+ \d+ \d+$"):
+                    # TODO what is this?
+                    # maybe 713702 is download speed...
+                    # torrent name: [1000] 713702 564 0 14 19840 0 0 19840 0 0
+                    # torrent name: [1000] 0 0 0 0 0 0 0 0 0 0
+                    continue
+                self.logger.debug(f"alert: {a.message()}")
+            '''
 
     def monitor_peer_info_alert(self, a):
         # called from peer_info_alert
@@ -701,7 +855,7 @@ class BTCache:
             # TODO? call fetch_pieces
             # this is the only event where we get the "haves" bitfield from peers
             # and this is fired only once after the bitfield exchange
-            self.fetch_pieces(th, p.ip, p.pieces)
+            self.fetch_pieces(th, p.ip, p.pieces, peer=p)
 
     def enable_super_seeding(self, th):
         # enable super seeding mode
@@ -731,13 +885,260 @@ class BTCache:
         if super_seeding != 0:
             return
         # th.set_super_seeding(True) # deprecated
-        btih = th.torrent_file().info_hashes().v1
+        btih = str(th.torrent_file().info_hashes().v1)
         self.logger.debug(f"enable_super_seeding: enabling super_seeding for {btih}")
         flags |= lt.torrent_flags.super_seeding
         th.set_flags(flags)
 
-    def fetch_pieces(self, torrent_handle, peer_ip=None, peer_pieces=None):
-        pass
+    def fetch_pieces(self, th, peer_ip=None, peer_pieces=None, peer=None):
+        ti = th.torrent_file()
+        num_pieces = ti.num_pieces()
+        if peer_pieces is None:
+            self.logger.debug("fetch_pieces: no peer_pieces")
+            return
+        # Determine which pieces peer still needs
+        missing = []
+        active = self.active_prefetch[th]
+        for piece in range(num_pieces):
+            # peer already has it
+            if peer_pieces[piece]:
+                continue
+            # already cached locally
+            if self.cached_pieces[th][piece]:
+                continue
+            # already fetching
+            if piece in active:
+                continue
+            missing.append(piece)
+        if not missing:
+            # self.logger.debug("fetch_pieces: no pieces are missing")
+            return
+        # Torrent is useful NOW
+        self.activate_torrent(th)
+        # remember recent activity
+        self.last_activity[th] = time.time()
+        # Sequential fetch window
+        MAX_ACTIVE = 32
+        current = len(active)
+        if current >= MAX_ACTIVE:
+            msg = f"fetch_pieces: active_prefetch is full: {compress_ranges(active)}"
+            if msg != self.fetch_pieces_last_msg:
+                self.logger.debug(msg)
+                self.fetch_pieces_last_msg = msg
+            return
+        wanted = missing[:MAX_ACTIVE - current]
+        self.logger.info(
+            "fetch_pieces: scheduling pieces "
+            f"{compress_ranges(wanted)}"
+        )
+        # Enable pieces
+        for piece in wanted:
+            active.add(piece)
+            # HIGH priority
+            th.piece_priority(piece, 7)
+            try:
+                th.set_piece_deadline(piece, 0)
+            except Exception:
+                pass
+        # unlimited bandwidth while active
+        th.set_download_limit(0)
+
+    def compute_needed_pieces(self, th, peer_pieces):
+        ti = th.torrent_file()
+        needed = []
+        for piece in range(ti.num_pieces()):
+            # peer already has it
+            if peer_pieces[piece]:
+                continue
+            # TODO? dont trust libtorrent: th.have_piece(piece)
+            # we already have it cached
+            if th.have_piece(piece):
+                continue
+            # # piece disabled
+            # if th.piece_priority(piece) == 0:
+            #     continue
+            needed.append(piece)
+        # return needed[:self.config.max_incremental_fetch]
+        return needed
+
+    def update_cache_pressure(self):
+        # called from piece_finished_alert
+        # called periodically from monitor_loop
+        usage = self.cached_bytes()
+        ratio = usage / self.cache_size
+        old = self.cache_full
+        # hysteresis to avoid oscillation
+        if ratio >= 0.95:
+            self.cache_full = True
+        elif ratio <= 0.80:
+            self.cache_full = False
+        if self.cache_full == old:
+            return
+        if self.cache_full:
+            # TODO incrementally reduce download limit before cache is full
+            # based on free cache size and download_rate_limit
+            self.logger.info(f"Cache full -> throttling inactive torrents")
+            for th in self.session.get_torrents():
+                if th in self.active_torrents:
+                    continue
+                # 10*1024: performance_alert: performance warning: download limit too low (upload rate will suffer)
+                # fix: torrent_settings: rate_limit_ip_overhead: false
+                # th.set_download_limit(1) # uploads are too slow
+                th.set_download_limit(1024)
+        else:
+            self.logger.info(f"Cache has free space -> unthrottling torrents")
+            # TODO broad-first search
+            # download the first pieces of all torrents
+            # th.piece_priority(piece, 7) # for the first pieces: high priority
+            # th.piece_priority(piece, 1) # for all other pieces: low priority
+            for th in self.session.get_torrents():
+                if th in self.active_torrents:
+                    continue
+                th.set_download_limit(0)
+
+    # FIXME dont oscillate
+    # Deactivating torrent
+    # Activating torrent
+    # Deactivating torrent
+    # Activating torrent
+    #
+    # fix: schedule deactivation
+    # and in activate_torrent, remove the scheduled deactivation
+
+    def activate_torrent(self, th):
+        # cancel pending deactivation
+        self.todo_deactivate_torrent.pop(th, None)
+        if th in self.active_torrents:
+            return
+        self.active_torrents.add(th)
+        self.logger.info(f"Activating torrent {th.info_hash()}")
+        th.set_download_limit(0)
+
+    def activate_torrent_zzz(self, th):
+        # called from fetch_pieces
+        if th in self.active_torrents:
+            return
+        self.active_torrents.add(th)
+        self.logger.info(f"Activating torrent {th.info_hash()}")
+        th.set_download_limit(0)
+
+    def schedule_deactivate_torrent(self, th):
+        # called from cleanup_inactive_torrents
+        if th not in self.active_torrents:
+            return
+        if th in self.todo_deactivate_torrent:
+            return
+        timeout = 30
+        self.todo_deactivate_torrent[th] = time.time() + timeout
+        self.logger.info(
+            f"Scheduling deactivation of torrent "
+            f"{th.info_hash()} in {timeout}s"
+        )
+
+    def deactivate_torrent(self, th):
+        self.todo_deactivate_torrent.pop(th, None)
+        if th not in self.active_torrents:
+            return
+        self.active_torrents.remove(th)
+        self.logger.info(f"Deactivating torrent {th.info_hash()}")
+        if self.cache_full:
+            th.set_download_limit(1)
+
+    def process_pending_deactivations(self):
+        now = time.time()
+        for th, deadline in list(self.todo_deactivate_torrent.items()):
+            if now < deadline:
+                continue
+            peers = th.get_peer_info()
+            still_interested = False
+            for p in peers:
+                if p.flags & lt.peer_info.remote_interested:
+                    still_interested = True
+                    break
+            if still_interested:
+                # peer still downloading -> postpone
+                self.todo_deactivate_torrent[th] = now + 30
+                continue
+            self.deactivate_torrent(th)
+
+    def deactivate_torrent_zzz(self, th):
+        # called from cleanup_inactive_torrents
+        if th not in self.active_torrents:
+            return
+        self.active_torrents.remove(th)
+        self.logger.info(f"Deactivating torrent {th.info_hash()}")
+        if self.cache_full:
+            th.set_download_limit(1)
+
+    def cleanup_inactive_torrents(self):
+        # called periodically from monitor_loop
+        # we mutate self.active_torrents
+        # so we have to get a copy with list()
+        now = time.time()
+        for th in list(self.active_torrents):
+            last = self.last_upload_time.get(th, 0)
+            if now - last < 30:
+                continue
+            peers = th.get_peer_info()
+            interested = False
+            for p in peers:
+                if p.flags & lt.peer_info.remote_interested:
+                    interested = True
+                    break
+            if interested:
+                continue
+            self.schedule_deactivate_torrent(th)
+
+    def get_total_cache_usage_bytes(self):
+        # also count files that do not belong to torrents
+        usage = 0
+        for root, dirs, files in os.walk(self.config.save_dir):
+            for name in files:
+                path = os.path.join(root, name)
+                try:
+                    st = os.stat(path)
+                except FileNotFoundError:
+                    continue
+                usage += st.st_blocks * 512
+        return usage
+
+    def get_cache_usage_bytes(self):
+        usage = 0
+        visited = set()
+        for th_list in self.torrent_handles.values():
+            for th in th_list:
+                ti = th.torrent_file()
+                if ti is None:
+                    continue
+                save_path = th.status().save_path
+                fs = ti.files()
+                for file_index in range(fs.num_files()):
+                    rel_path = fs.file_path(file_index)
+                    full_path = os.path.join(save_path, rel_path)
+                    # avoid double-counting shared files
+                    if full_path in visited:
+                        continue
+                    visited.add(full_path)
+                    try:
+                        st = os.stat(full_path)
+                    except FileNotFoundError:
+                        continue
+                    # actual allocated disk blocks
+                    usage += st.st_blocks * 512
+        return usage
+
+    def set_piece_priority_1(self):
+        # called periodically from monitor_loop
+        now = time.time()
+        for th, piece_later in self.todo_set_piece_priority_1.items():
+            # we mutate piece_later
+            # so we have to get a copy with list()
+            for piece, later in list(piece_later.items()):
+                if later < now:
+                    continue
+                # the time has come!
+                th.piece_priority(piece, 1)
+                del piece_later[piece]
 
     def monitor_torrent(self, th, host):
         try:
@@ -750,83 +1151,200 @@ class BTCache:
             status = th.status()
             tf = th.torrent_file()
             n_pieces = tf.num_pieces()
-            btih = tf.info_hashes().v1
+            btih = str(tf.info_hashes().v1)
 
-            # Collect enabled and downloaded piece indices
-            enabled_indices = [i for i in range(n_pieces) if th.piece_priority(i) > 0]
-            have_indices = [i for i in range(n_pieces) if th.have_piece(i)]
+            # Collect fetching and have piece indices
+            # fetching_pieces = [i for i, v in enumerate(status.pieces) if not v and th.piece_priority(i) > 0]
+            # prefetching_pieces = [i for i, v in enumerate(status.pieces) if not v and th.piece_priority(i) == 7]
+            have_pieces = [i for i, v in enumerate(status.pieces) if v]
 
-            # Compress ranges for readability
-            enabled_ranges = compress_ranges(enabled_indices)
-            have_ranges = compress_ranges(have_indices)
-            active_prefetch_ranges = compress_ranges(self.active_prefetch[th])
-
-            # Compute byte-level progress
-            total = status.total_wanted
-            done = status.total_wanted_done
-            percent = (done / total * 100) if total > 0 else 0.0
+            flags = th.flags()
+            sequential_download = bool(flags & lt.torrent_flags.sequential_download)
 
             msg = (
                 f"monitor_torrent: host={host}:"
-                f" btih={btih}"
+                # f" btih={btih}"
+                f" btih={btih[:7]}"
                 f" state={status.state}"
-                f" progress={done}/{total} bytes ({percent:.2f}%)"
-                f" enabled={enabled_ranges}"
-                f" have={have_ranges}"
-                f" active_prefetch={active_prefetch_ranges}"
-                f" num_peers={th.status().num_peers}"
-                f" num_seeds={th.status().num_seeds}"
+                # f" progress={status.total_wanted_done}/{status.total_wanted} bytes ({status.progress:.2%})"
+                f" progress={status.progress:.2%}"
+                # f" done_pieces={len(have_pieces)}/{len(status.pieces)}"
+                # f" download={status.download_rate} B/s"
+                # f" upload={status.upload_rate} B/s"
+                # torrent_settings: rate_limit_ip_overhead: false
+                # noisy. dont add these to last_msg
+                # f" download={status.download_payload_rate} B/s"
+                # f" upload={status.upload_payload_rate} B/s"
+                f" have={compress_ranges(have_pieces)}/{len(status.pieces)}"
+                # f" fetching={compress_ranges(fetching_pieces)}"
+                f" prefetching={compress_ranges(self.active_prefetch[th])}"
+                f" num_peers={status.num_peers}"
+                f" num_seeds={status.num_seeds}"
+                f" sequential_download={sequential_download}"
+                # f" dir(status)={dir(status)}" # debug
             )
             if msg != self.monitor_torrent_last_msg:
-                self.logger.info(msg)
                 self.monitor_torrent_last_msg = msg
+                msg += (
+                    f" download={status.download_payload_rate} B/s"
+                    f" upload={status.upload_payload_rate} B/s"
+                )
+                self.logger.info(msg)
 
-            if str(status.state) == "downloading":
+            if status.state.downloading:
                 self.ensure_hidden_peers_connected(th)
 
         except Exception as e:
             self.logger.info(f"Error fetching status for torrent: {e}")
 
     def evict_old_pieces(self):
-        total = self.cached_bytes()
-        if total <= self.cache_size:
+        # called from piece_finished_alert
+        usage = self.cached_bytes()
+        # usage = self.get_cache_usage_bytes()
+        cache_usage_msg = f"cache usage: {usage/self.cache_size:.2%}"
+        if usage <= self.cache_size:
+            self.logger.info(
+                f"evict_old_pieces: not evicting old pieces. "
+                f"{cache_usage_msg}"
+            )
             return
+        self.logger.info(
+            f"evict_old_pieces: evicting old pieces. "
+            f"{cache_usage_msg}"
+        )
+        for age, size, th, piece in self.get_evict_piece_candidates():
+            if usage <= self.cache_size:
+                break
+            self.evict_piece(th, piece)
+            usage -= size
+
+    def evict_old_pieces_zzzzzzzz(self):
+        usage = self.cached_bytes()
+        # cache_usage_msg = f"cache usage: {usage}/{self.cache_size} = {usage/self.cache_size:.2%}"
+        cache_usage_msg = f"cache usage: {usage/self.cache_size:.2%}"
+        if usage <= self.cache_size:
+            self.logger.info(f"evict_old_pieces: not evicting old pieces. {cache_usage_msg}")
+            return
+        self.logger.info(f"evict_old_pieces: evicting old pieces. {cache_usage_msg}")
+        # TODO refactor: get_evict_piece_candidates
         candidates = []
         now = time.time()
         for th, timestamps in self.uploaded_piece_time.items():
             ti = th.torrent_file()
             for piece, last_access in enumerate(timestamps):
                 # skip uncached pieces
-                if not th.have_piece(piece):
+                if last_access == 0:
+                    continue
+                # if not th.have_piece(piece): # no. dont trust libtorrent
+                if not self.cached_pieces[th][piece]:
                     continue
                 # never evict active downloads
-                if th.piece_priority(piece) != 0:
+                # if th.piece_priority(piece) != 0:
+                if piece in self.active_prefetch[th]:
                     continue
-                r'''
-                TODO maybe also honor minimum_residency_time
-                self.min_piece_age = 30
-                if now - last_access < self.min_piece_age:
-                    continue
-                '''
-                r'''
-                TODO
-                # never evict pieces currently being uploaded
-                recently_uploaded[piece] = now
-                if piece in currently_requested_pieces:
-                    continue
-                '''
                 age = now - last_access
                 candidates.append((age, th, piece))
         candidates.sort(reverse=True)
         for age, th, piece in candidates:
-            if total <= self.cache_size:
+            if usage <= self.cache_size:
                 break
             size = th.torrent_file().piece_size(piece)
             self.evict_piece(th, piece)
-            total -= size
+            usage -= size
+
+    def trim_cache_hard(self):
+        # called periodically from monitor_loop
+        usage = self.get_cache_usage_bytes()
+        limit = self.cache_size
+        if usage <= limit:
+            return
+        target_rel = 0.8
+        target = int(limit * target_rel)
+        self.logger.info(
+            f"trim_cache_hard: usage={usage/limit:.2%}"
+            f" target={target_rel:.2%}"
+        )
+        for age, size, th, piece in self.get_evict_piece_candidates():
+            if usage <= target:
+                break
+            self.evict_piece(th, piece)
+            usage -= size
+
+    def trim_cache_hard_zzzzzzzz(self):
+        usage = self.get_cache_usage_bytes()
+        limit = self.cache_size
+        if usage <= limit:
+            return
+        self.logger.info(f"trim_cache_hard: usage={usage} limit={limit}")
+        target = int(limit * 0.8)
+        # TODO refactor: get_evict_piece_candidates
+        candidates = []
+        now = time.time()
+        for th, timestamps in self.uploaded_piece_time.items():
+            ti = th.torrent_file()
+            if ti is None:
+                continue
+            for piece, last_access in enumerate(timestamps):
+                if last_access == 0:
+                    continue
+                if not self.cached_pieces[th][piece]:
+                    continue
+                if piece in self.active_prefetch[th]:
+                    continue
+                age = now - last_access
+                candidates.append((age, th, piece))
+        candidates.sort(reverse=True)
+        for age, th, piece in candidates:
+            if usage <= target:
+                break
+            size = th.torrent_file().piece_size(piece)
+            self.evict_piece(th, piece)
+            usage -= size
+
+    def get_evict_piece_candidates(self):
+        candidates = []
+        now = time.time()
+        for th, timestamps in self.uploaded_piece_time.items():
+            ti = th.torrent_file()
+            if ti is None:
+                continue
+            active = self.active_prefetch[th]
+            for piece, last_access in enumerate(timestamps):
+                # never uploaded / accessed
+                if last_access == 0:
+                    continue
+                # already evicted
+                # no. dont trust self.cached_pieces
+                # if not self.cached_pieces[th][piece]:
+                if not self.piece_exists_on_disk(th, piece):
+                    continue
+                # never evict active downloads
+                if piece in active:
+                    continue
+                age = now - last_access
+                size = ti.piece_size(piece)
+                candidates.append((age, size, th, piece))
+        candidates.sort(reverse=True)
+        return candidates
 
     def cached_bytes(self):
-        total = 0
+        usage = 0
+        for th, pieces in self.cached_pieces.items():
+            ti = th.torrent_file()
+            if ti is None:
+                continue
+            for piece, cached in enumerate(pieces):
+                if not cached:
+                    continue
+                usage += ti.piece_size(piece)
+        return usage
+
+    def cached_bytes_zzzzzzzzz(self):
+        # FIXME this is probably wrong
+        # since st.pieces is wrong (?)
+        # see also: def evict_piece
+        # so this should use self.cached_pieces[th][piece]
+        usage = 0
         for th in self.uploaded_piece_time.keys():
             ti = th.torrent_file()
             if ti is None:
@@ -836,8 +1354,8 @@ class BTCache:
             for piece, have in enumerate(pieces):
                 if not have:
                     continue
-                total += ti.piece_size(piece)
-        return total
+                usage += ti.piece_size(piece)
+        return usage
 
     # ------------------------------------------------------------------
     # Main control
@@ -947,6 +1465,7 @@ format_size = lambda n:(
 
 import ctypes
 import ctypes.util
+import io
 
 c_off_t = ctypes.c_int64
 
@@ -962,7 +1481,9 @@ def make_fallocate():
     del libc_name
 
     def fallocate(fd, mode, offset, len_):
-        res = _fallocate(fd.fileno(), mode, offset, len_)
+        if isinstance(fd, io.IOBase):
+            fd = fd.fileno()
+        res = _fallocate(fd, mode, offset, len_)
         if res != 0:
             raise IOError(res, 'fallocate')
 

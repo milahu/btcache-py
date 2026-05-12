@@ -27,3 +27,5 @@ torrent_settings:
   upload_rate_limit: 1048576 # 1 MiB/s
   # fix: By default peers on the local network are not rate limited.
   ignore_limits_on_local_network: false
+  # fix: performance_alert: performance warning: download limit too low (upload rate will suffer)
+  rate_limit_ip_overhead: false

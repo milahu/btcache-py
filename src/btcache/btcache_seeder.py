@@ -18,6 +18,7 @@ import torf
 POLL_INTERVAL = 1.0
 
 debug_alerts = 0
+# debug_alerts = 1
 
 ignore_alert_types = (
     lt.tracker_error_alert,
@@ -258,6 +259,8 @@ def main():
 
     logger.info(f"Listening on {args.listen}")
 
+    peer_last_msg = {}
+
     try:
         last_msg = None
         while True:
@@ -275,10 +278,14 @@ def main():
                 last_msg = msg
             for p in peers:
                 ip, port = getattr(p, "ip", None)
+                peer_id = f"{ip}:{port}"
                 pieces_bitfield = getattr(p, "pieces", [])
                 missing_pieces = [i for i, has in enumerate(pieces_bitfield) if not has]
                 missing_piece_ranges = compress_ranges(missing_pieces)
-                logger.info(f"  peer {ip}:{port} missing pieces: {missing_piece_ranges}")
+                msg = f"  peer {peer_id} missing pieces: {missing_piece_ranges}"
+                if msg != peer_last_msg.get(peer_id):
+                    logger.info(msg)
+                    peer_last_msg[peer_id] = msg
 
             def get_message(alert):
                 message = alert.message()

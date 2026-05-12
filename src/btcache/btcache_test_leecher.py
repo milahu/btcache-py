@@ -17,6 +17,7 @@ import libtorrent as lt
 POLL_INTERVAL = 1.0
 
 debug_alerts = 0
+# debug_alerts = 1
 
 ignore_alert_types = (
     lt.tracker_error_alert,
@@ -375,24 +376,28 @@ def main():
                 # FIXME this is always reached. why no live_status?
                 # logger.debug(f"status: using cached status - FIXME")
                 status = th.status()
-            downloading = [i for i, v in enumerate(status.pieces) if not v and th.piece_priority(i) > 0]
-            compressed = compress_ranges(downloading)
-
-            # Compute progress
-            total = status.total_wanted
-            done = status.total_wanted_done
-            percent = (done / total * 100) if total > 0 else 0.0
-
-            done_pieces = len(list(filter(lambda x: x, status.pieces)))
+            fetching_pieces = [i for i, v in enumerate(status.pieces) if not v and th.piece_priority(i) > 0]
+            done_pieces = [i for i, v in enumerate(status.pieces) if v]
+            num_done_pieces = len(list(filter(lambda x: x, status.pieces)))
 
             msg = (
-                f"state={status.state} progress={done}/{total} bytes ({percent:.2f}%) "
-                f"fetching_pieces={compressed}"
-                f" done_pieces={done_pieces}/{len(status.pieces)}"
+                f"state={status.state}"
+                # f" progress={status.total_wanted_done}/{status.total_wanted} bytes ({status.progress:.2%})"
+                f" progress={status.progress:.2%}"
+                # f" done_pieces={num_done_pieces}/{len(status.pieces)}"
+                f" done_pieces={compress_ranges(done_pieces)}/{len(status.pieces)}"
+                f" fetching_pieces={compress_ranges(fetching_pieces)}"
+                # noisy. dont add these to last_msg
+                # f" download={status.download_payload_rate} B/s"
+                # f" upload={status.upload_payload_rate} B/s"
             )
             if msg != last_msg:
-                logger.info(msg)
                 last_msg = msg
+                msg += (
+                    f" download={status.download_payload_rate} B/s"
+                    f" upload={status.upload_payload_rate} B/s"
+                )
+                logger.info(msg)
 
             for p in peers:
                 ip, port = getattr(p, "ip", None)
@@ -409,6 +414,10 @@ def main():
                 if msg != last_peer_msg.get(peer_id):
                     logger.info(msg)
                     last_peer_msg[peer_id] = msg
+
+            if status.progress == 1:
+                logger.info(f"download is complete -> exit")
+                sys.exit()
 
         except Exception as e:
             logger.info(f"Error querying peers: {e}")
